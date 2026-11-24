@@ -20,6 +20,7 @@ from providers.base import (
     ProviderError,
     SearchResult,
     as_items,
+    decode_mcp_response,
     expect_dict,
 )
 
@@ -29,35 +30,6 @@ _HEADERS = {
     "Accept": "application/json, text/event-stream",
     "Content-Type": "application/json",
 }
-
-
-def _decode_response(response: httpx.Response) -> dict:
-    """兼容普通 JSON 和 text/event-stream 两种 MCP 响应。"""
-    if response.status_code >= 400:
-        raise ProviderError(
-            f"HTTP {response.status_code}: {response.text[:200]}",
-            status=response.status_code,
-        )
-    text = response.text.strip()
-    if response.headers.get("content-type", "").startswith("text/event-stream"):
-        payloads = [
-            line[5:].strip()
-            for line in text.splitlines()
-            if line.startswith("data:")
-        ]
-        if not payloads:
-            raise ProviderError("MCP SSE 响应没有 data")
-        text = payloads[-1]
-    try:
-        data = json.loads(text)
-    except ValueError as exc:
-        raise ProviderError(f"MCP 响应不是 JSON: {text[:200]}") from exc
-    if not isinstance(data, dict):
-        raise ProviderError("MCP 响应不是对象")
-    if data.get("error"):
-        error = data["error"]
-        raise ProviderError(f"MCP 错误: {str(error)[:300]}", retryable=False)
-    return data.get("result") or {}
 
 
 async def _initialize(client: httpx.AsyncClient) -> dict:
@@ -77,7 +49,7 @@ async def _initialize(client: httpx.AsyncClient) -> dict:
         },
         timeout=SEARCH_TIMEOUT,
     )
-    result = _decode_response(response)
+    result = decode_mcp_response(response)
     session = response.headers.get("mcp-session-id")
     if session:
         headers["Mcp-Session-Id"] = session
@@ -110,7 +82,7 @@ async def _call_tool(client: httpx.AsyncClient, name: str, arguments: dict, key:
         )
     except httpx.HTTPError as exc:
         raise ProviderError(f"网络错误: {type(exc).__name__}: {exc}") from exc
-    result = _decode_response(response)
+    result = decode_mcp_response(response)
     if result.get("isError"):
         raise ProviderError(str(result.get("content") or result)[:300], retryable=False)
     return result

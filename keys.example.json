@@ -23,5 +23,26 @@
   "perplexity": [],
   "firecrawl": [],
   "querit": [],
-  "ollama": []
+  "ollama": [],
+  "keenable": [
+    "your-keenable-key-optional"
+  ],
+  "anysearch": [
+    "your-anysearch-key-optional"
+  ],
+  "youcom": [
+    "your-youcom-key-optional"
+  ],
+  "baidu": [
+    "your-baidu-qianfan-key"
+  ],
+  "yuanbao": [
+    "your-yuanbao-search-key"
+  ],
+  "zhipu": [
+    "your-zhipu-key"
+  ],
+  "bocha": [
+    "your-bocha-key"
+  ]
 }

@@ -99,6 +99,13 @@ _KEY_ENV_NAMES: dict[str, list[str]] = {
     "serper": ["SERPER_API_KEYS", "SERPER_API_KEY"],
     "serpapi": ["SERPAPI_API_KEYS", "SERPAPI_API_KEY"],
     "linkup": ["LINKUP_API_KEYS", "LINKUP_API_KEY"],
+    "anysearch": ["ANYSEARCH_API_KEYS", "ANYSEARCH_API_KEY"],
+    "keenable": ["KEENABLE_API_KEYS", "KEENABLE_API_KEY"],
+    "youcom": ["YDC_API_KEYS", "YDC_API_KEY", "YOUCOM_API_KEYS", "YOUCOM_API_KEY"],
+    "baidu": ["BAIDU_API_KEYS", "BAIDU_API_KEY"],
+    "yuanbao": ["TENCENTCLOUD_WSA_APIKEYS", "TENCENTCLOUD_WSA_APIKEY"],
+    "zhipu": ["ZHIPU_API_KEYS", "ZHIPU_API_KEY"],
+    "bocha": ["BOCHA_API_KEYS", "BOCHA_API_KEY"],
 }
 
 
@@ -166,7 +173,7 @@ FIRECRAWL_BASE_URL: str = (
 )
 
 # 无 key 也能用（但需要上面的实例地址）
-KEYLESS_PROVIDERS: set[str] = {"searxng", "parallel"}
+KEYLESS_PROVIDERS: set[str] = {"searxng", "parallel", "anysearch", "keenable", "youcom"}
 
 # 可选：SEARCH_PROVIDERS=tavily,querit —— 在已配 key 的基础上再限定默认启用子集
 _raw = os.environ.get("SEARCH_PROVIDERS", "")
@@ -183,7 +190,7 @@ SEARCH_PROXY_ALL: bool = os.environ.get("SEARCH_PROXY_ALL", "").strip().lower() 
 )
 # 这些源在实测中国内直连不稳；可按自己的网络情况用 PROXY_PROVIDERS 覆盖
 PROXY_PROVIDERS: set[str] = set(
-    _split(os.environ.get("PROXY_PROVIDERS", "jina,duckduckgo"))
+    _split(os.environ.get("PROXY_PROVIDERS", "jina,duckduckgo,youcom"))
 )
 
 # 免 key 来源是否默认参与聚合搜索。
@@ -223,6 +230,28 @@ FETCH_MAX_CHARS: int = _env_number("FETCH_MAX_CHARS", 20000, int, minimum=1000)
 
 # 单家结果条数硬上限：各家 API 各有上限，统一卡在这里避免上游 400
 MAX_RESULTS_CAP: int = _env_number("MAX_RESULTS_CAP", 20, int, minimum=1)
+# 最终交付条数独立于每家抓取条数，避免 max_results=3 时只交付 6 条
+TOTAL_RESULTS: int = _env_number("TOTAL_RESULTS", 12, int, minimum=1)
+NEAR_DEDUP: bool = os.environ.get("NEAR_DEDUP", "true").strip().lower() not in ("0", "false", "no", "off")
+
+# 搜索成本控制：auto 先查匿名源，质量不足才有限启用带 key 的源。
+# 这些阈值只做第一道确定性门禁；最终语义是否充足由当前 Agent 结合证据判断。
+SEARCH_MODE: str = os.environ.get("SEARCH_MODE", "auto").strip().lower()
+FREE_PROVIDERS: list[str] = _split(
+    os.environ.get("FREE_PROVIDERS", "parallel,keenable,anysearch")
+)
+PAID_PROVIDERS: list[str] = _split(
+    os.environ.get("PAID_PROVIDERS", "volcengine,querit,tavily,exa,firecrawl,jina,yuanbao,baidu,zhipu,bocha")
+)
+AUTO_ESCALATE_MAX: int = _env_number("AUTO_ESCALATE_MAX", 3, int, minimum=0)
+AUTO_MIN_RESULTS: int = _env_number("AUTO_MIN_RESULTS", 4, int, minimum=1)
+AUTO_MIN_UNIQUE: int = _env_number("AUTO_MIN_UNIQUE", 3, int, minimum=1)
+AUTO_MIN_CONSENSUS: int = _env_number("AUTO_MIN_CONSENSUS", 1, int, minimum=0)
+# 含比较、最新、价格、政策、多实体等语义时提高门禁，不能仅凭结果数量直接交付。
+COMPLEX_QUERY_PATTERNS: list[str] = _split(os.environ.get(
+    "COMPLEX_QUERY_PATTERNS",
+    "对比,比较,区别,哪个好,最新,今天,近期,价格,政策,法规,风险,评测,深度,分析,vs,versus,compare,latest,pricing",
+))
 
 # key 限额状态落盘位置（只存 key 的哈希和状态，不存 key 本身）
 # 相对路径一律挂到项目目录，避免不同启动 CWD 写到意外位置

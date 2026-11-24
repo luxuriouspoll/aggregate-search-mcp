@@ -24,11 +24,28 @@ from providers import (
     run_fetch,
     run_search,
 )
-from providers.base import SearchResult, merge_results, normalize_url
+from providers.base import (
+    SearchResult,
+    decode_mcp_response,
+    fold_near_duplicates,
+    merge_results,
+    normalize_url,
+)
 
 
 def demo_merge() -> None:
     """无 key 也能跑：用 mock 数据验证 URL 归一化 + 合并去重排序。"""
+    import httpx
+
+    sse = httpx.Response(
+        200,
+        headers={"Content-Type": "text/event-stream"},
+        text='event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"content":[]}}\n\n',
+    )
+    assert decode_mcp_response(sse) == {"content": []}
+    assert normalize_url("https://example.com/a?share_token=one") != normalize_url(
+        "https://example.com/a?share_token=two"
+    )
     groups = {
         "tavily": [
             SearchResult("tavily", "https://www.example.com/a?utm_source=x", "Example A", "短摘要", 0),
@@ -67,6 +84,56 @@ def demo_merge() -> None:
         "[demo] 合并去重 OK：7 条 mock -> 4 条；跨家聚合、默认端口/参数顺序/跟踪参数归一，"
         "带参 URL 与裸 URL 正确区分"
     )
+
+    # 多份摘要必须保留，不能因同 URL 合并而丢互补证据
+    evidence = merge_results({
+        "tavily": [SearchResult("tavily", "https://example.com/evidence", "证据标题", "第一家给出的定义和背景信息", 0)],
+        "exa": [SearchResult("exa", "https://example.com/evidence", "证据标题", "第二家补充了发布日期和适用范围", 1)],
+    })[0]
+    assert len(evidence["evidence"]) == 2
+    assert len(evidence["snippets"]) == 2
+    assert evidence["source_count"] == 2
+
+    long_text = "模型上下文协议为 AI 应用连接外部工具和数据提供统一标准，并支持多种传输方式。"
+    copies = merge_results({
+        "one": [SearchResult("one", "https://one.example/article", "模型上下文协议完整指南", long_text, 0)],
+        "two": [SearchResult("two", "https://two.example/repost", "模型上下文协议完整指南", long_text, 0)],
+    })
+    folded, count = fold_near_duplicates(copies)
+    assert count == 1 and len(folded) == 1
+    assert folded[0]["alternate_urls"] == ["https://two.example/repost"]
+    assert folded[0]["source_count"] == 2
+
+    # 同一主题但内容不同的文章不能因关键词相似而被误删
+    distinct = merge_results({
+        "one": [SearchResult("one", "https://one.example/install", "MCP 安装教程", "这篇文章逐步介绍 Windows 下的 Python 环境安装和客户端配置方法。", 0)],
+        "two": [SearchResult("two", "https://two.example/security", "MCP 安全分析", "这篇文章讨论权限边界、提示注入风险和远程服务器的安全审计问题。", 0)],
+    })
+    kept, count = fold_near_duplicates(distinct)
+    assert count == 0 and len(kept) == 2
+
+    # 只差版本号、年份或关键数字时，即使字符串很相似也禁止折叠
+    versions = merge_results({
+        "one": [SearchResult("one", "https://one.example/v13", "Python 3.13 新特性完整指南", "本文介绍 Python 3.13 的新特性、性能变化和升级注意事项，适用于准备升级的开发者。", 0)],
+        "two": [SearchResult("two", "https://two.example/v14", "Python 3.14 新特性完整指南", "本文介绍 Python 3.14 的新特性、性能变化和升级注意事项，适用于准备升级的开发者。", 0)],
+    })
+    version_kept, version_count = fold_near_duplicates(versions)
+    assert version_count == 0 and len(version_kept) == 2
+
+    # 折叠新增来源后必须重新计算 source_count、best_rank 和排序
+    rerank_input = merge_results({
+        "a": [SearchResult("a", "https://a.example/story", "相同文章标题用于测试排序", "这是完全相同的文章摘要内容，用于验证转载折叠后的排名和来源统计是否正确。", 8)],
+        "b": [SearchResult("b", "https://b.example/repost", "相同文章标题用于测试排序", "这是完全相同的文章摘要内容，用于验证转载折叠后的排名和来源统计是否正确。", 9)],
+        "c": [SearchResult("c", "https://c.example/other", "另一篇独立文章", "完全不同的内容用于产生一个独立结果，不应和前面的文章合并。", 0)],
+        "d": [SearchResult("d", "https://d.example/other", "另一篇独立文章", "完全不同的内容用于产生一个独立结果，不应和前面的文章合并。", 0)],
+    })
+    reranked, rerank_count = fold_near_duplicates(rerank_input)
+    assert rerank_count == 1
+    repost = next(x for x in reranked if x["url"] == "https://a.example/story")
+    assert repost["source_count"] == 2 and repost["best_rank"] == 8
+    assert repost["evidence"][1]["url"] == "https://b.example/repost"
+    assert reranked[0]["source_count"] == 2
+    print("[demo] 证据汇总 OK：多摘要保留、近似转载折叠且留链、不同文章/版本不误合并、折叠后重排")
 
 
 def demo_keypool() -> None:
@@ -195,6 +262,51 @@ async def check_fetch(url: str, provider: str) -> None:
     print(f"       开头: {head}…")
 
 
+async def demo_cost_modes() -> None:
+    """用 mock 验证 auto 不浪费 key、限量升级和 free 硬约束。"""
+    import server
+
+    original = server.run_search
+    calls: list[list[str]] = []
+
+    async def fake_search(names, query, max_results):
+        calls.append(list(names))
+        if "parallel" in names:
+            groups = {
+                "parallel": [
+                    SearchResult("parallel", f"https://example.com/{i}", "MCP 协议指南", "MCP 是模型上下文协议，用于连接 AI 应用、工具和数据源。", i)
+                    for i in range(4)
+                ]
+            }
+            return groups, {}
+        return {name: [] for name in names}, {}
+
+    server.run_search = fake_search
+    try:
+        text = await server.web_search("MCP 协议是什么", search_mode="auto")
+        assert calls == [["parallel", "keenable", "anysearch"]], calls
+        assert "未消耗任何账号 key 积分" in text
+        calls.clear()
+
+        # 无结果时，auto 必须追加 3 个不同厂商，而不是同一厂商多个 key。
+        async def empty_search(names, query, max_results):
+            calls.append(list(names))
+            return {name: [] for name in names}, {}
+
+        server.run_search = empty_search
+        await server.web_search("2026 最新版本对比和迁移风险分析", search_mode="auto")
+        assert len(calls) == 2, calls
+        assert calls[1] == ["volcengine", "querit", "tavily"], calls
+        assert len(set(calls[1])) == 3
+        calls.clear()
+
+        await server.web_search("MCP 协议是什么", providers=["tavily"], search_mode="free")
+        assert not calls, "free 模式不应发起带 key 请求"
+    finally:
+        server.run_search = original
+    print("[demo] 成本模式 OK：门禁通过不升级、不足追加 3 个不同厂商、free 禁止 key")
+
+
 async def main() -> None:
     # Windows 控制台/管道默认 GBK，统一为 UTF-8 避免中文乱码
     for stream in (sys.stdout, sys.stderr):
@@ -204,6 +316,7 @@ async def main() -> None:
     if argv and argv[0] == "--demo":
         demo_merge()
         demo_keypool()
+        await demo_cost_modes()
         return
     if argv and argv[0] == "--status":
         show_status()

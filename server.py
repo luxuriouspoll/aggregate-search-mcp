@@ -14,9 +14,21 @@ import sys
 
 from mcp.server.fastmcp import FastMCP
 
-from config import DEFAULT_FETCH_PROVIDER, DEFAULT_MAX_RESULTS, MAX_RESULTS_CAP
+from config import (
+    AUTO_ESCALATE_MAX,
+    DEFAULT_FETCH_PROVIDER,
+    DEFAULT_MAX_RESULTS,
+    FREE_PROVIDERS,
+    MAX_RESULTS_CAP,
+    NEAR_DEDUP,
+    PAID_PROVIDERS,
+    SEARCH_MODE,
+    AUTO_ESCALATE_MAX,
+    TOTAL_RESULTS,
+)
 from providers import (
     FETCH_PROVIDERS,
+    POOLS,
     REGISTRY,
     enabled_search_providers,
     pool_status,
@@ -24,12 +36,10 @@ from providers import (
     run_fetch,
     run_search,
 )
-from providers.base import ProviderError, merge_results
+from providers.base import ProviderError, fold_near_duplicates, merge_results
+from quality import assess_quality
 
 mcp = FastMCP("aggregate-search")
-
-# 聚合结果总量上限：每家各限 max_results，去重合并后再整体截到这里（倍数）
-_MERGE_MULTIPLIER = 2
 
 # 没配 key 的家在结果里提示一下，避免误以为「搜过了但没有」
 _UNCONFIGURED_HINT = {
@@ -48,36 +58,93 @@ _UNCONFIGURED_HINT = {
     "serper": "SERPER_API_KEY",
     "serpapi": "SERPAPI_API_KEY",
     "linkup": "LINKUP_API_KEY",
+    "anysearch": "ANYSEARCH_API_KEY（可选；匿名也免费）",
+    "keenable": "KEENABLE_API_KEY（可选；匿名也免费）",
+    "youcom": "YDC_API_KEY（可选；匿名免费档需代理时配置 SEARCH_PROXY）",
+    "baidu": "BAIDU_API_KEY",
+    "yuanbao": "TENCENTCLOUD_WSA_APIKEY",
+    "zhipu": "ZHIPU_API_KEY",
+    "bocha": "BOCHA_API_KEY",
 }
 
 
-def _format_search(query: str, merged: list[dict], results: dict, errors: dict) -> str:
-    lines = [f"## 搜索结果：{query}", ""]
+def _format_search(
+    query: str,
+    merged: list[dict],
+    results: dict,
+    errors: dict,
+    stats: dict,
+) -> str:
+    lines = [f"## 联网搜索统一汇总：{query}", ""]
+    lines.append(
+        f"已查询 **{stats['attempted']} 家**，有效返回 **{stats['succeeded']} 家**"
+        + (f"，空结果 **{stats['empty']} 家**" if stats["empty"] else "")
+        + (f"，失败 **{len(errors)} 家**" if errors else "")
+        + f"；原始命中 **{stats['raw']} 条**，同 URL 归并后 **{stats['unique']} 个页面**"
+        + (f"，近似重复折叠 **{stats['folded']} 条**" if stats["folded"] else "")
+        + f"，以下交付 **{len(merged)} 个页面**"
+        + (f"；另有 **{stats['omitted_pages']} 个页面**因 total_results 上限未展示" if stats["omitted_pages"] else "")
+        + "。"
+    )
+    consensus = [item for item in merged if item["source_count"] >= 2]
+    if consensus:
+        lines.append("")
+        lines.append("### 多源共识")
+        for item in consensus[:5]:
+            lines.append(
+                f"- {item['title'] or item['url']}（{item['source_count']} 家："
+                f"{', '.join(item['sources'])}）"
+            )
+    lines.append("")
+    if stats.get("quality"):
+        lines.extend(["### 质量门禁与成本审计", stats["quality"], ""])
+    lines.append("### 去重后的证据列表")
     if not merged:
         lines.append("（没有返回任何结果）")
     for i, item in enumerate(merged, 1):
         title = item["title"] or item["url"]
         lines.append(f"{i}. [{title}]({item['url']})")
-        if item["snippet"]:
-            lines.append(f"   {item['snippet']}")
+        # 按来源展示证据，折叠后的摘要仍能追溯到具体 URL。
+        evidence = []
+        seen_evidence = set()
+        for entry in item["evidence"]:
+            key = (entry["source"], entry["url"], entry["snippet"], entry["published"])
+            if key not in seen_evidence:
+                seen_evidence.add(key)
+                evidence.append(entry)
+        for entry in evidence[:3]:
+            snippet = entry["snippet"]
+            suffix = "…[摘要截断]" if len(snippet) > 500 else ""
+            date = f" ｜ {entry['published']}" if entry["published"] else ""
+            lines.append(f"   - **{entry['source']}**{date}: {snippet[:500]}{suffix}")
+            if entry["url"] != item["url"]:
+                lines.append(f"     证据 URL: {entry['url']}")
+        if len(evidence) > 3:
+            lines.append(f"   - 另有 {len(evidence) - 3} 条同源/转载证据因单页展示预算省略")
         meta = "来源: " + ", ".join(item["sources"])
-        if item["published"]:
-            meta += f" ｜ 发布: {item['published']}"
+        if item["published_dates"]:
+            dates = item["published_dates"]
+            meta += " ｜ 发布: " + " / ".join(dates[:2])
+            if len(dates) > 2:
+                meta += f" 等 {len(dates)} 个日期"
+        if item.get("alternate_urls"):
+            meta += f" ｜ 近似转载 {len(item['alternate_urls'])} 条"
         lines.append(f"   {meta}")
+        if item.get("alternate_urls"):
+            lines.append("   转载链接: " + "；".join(item["alternate_urls"]))
         lines.append("")
     lines.append("### 提供商状态")
     lines.extend(f"- {name}: OK（{len(items)} 条）" for name, items in results.items())
     lines.extend(f"- {name}: 失败（{msg}）" for name, msg in errors.items())
 
-    # key 池状态：只在有 key 的家上显示，便于发现额度问题
-    pool_lines = []
-    for name, line in pool_status().items():
-        if name in results or name in errors:
-            pool_lines.append(f"- {name}: {line}")
+    statuses = pool_status()
+    pool_lines = [
+        f"- {name}: {line}"
+        for name, line in statuses.items()
+        if name in results or name in errors
+    ]
     if pool_lines:
-        lines.append("")
-        lines.append("### key 状态")
-        lines.extend(pool_lines)
+        lines.extend(["", "### key 状态", *pool_lines])
     return "\n".join(lines)
 
 
@@ -86,16 +153,26 @@ async def web_search(
     query: str,
     max_results: int | None = None,
     providers: list[str] | None = None,
+    total_results: int | None = None,
+    search_mode: str = "",
 ) -> str:
-    """联网搜索（聚合）：并发调用所有已启用的搜索提供商（Tavily/Querit/Firecrawl/Ollama/
-    Brave/Exa/Jina/Perplexity/火山引擎/DuckDuckGo/SearXNG），合并去重后返回 Markdown 结果列表，
-    同一 URL 聚合标记全部来源。单家失败不影响整体；同一家配了多个 key 会自动轮询。
+    """联网搜索、质量门禁、去重和统一证据汇总。
+
+    默认 auto：先查 Parallel/Keenable/AnySearch 匿名源，不消耗 key；
+    覆盖不足时最多补查 2 个已配置的 key 源，再统一交付给当前 Agent 语义审核。
+    free：仅匿名源，保证不消耗账号积分。
+    all：查询全部已启用厂商，保持完整聚合行为。
 
     Args:
         query: 搜索关键词
-        max_results: 每家返回条数上限，默认 5；合并去重后总条数约不超过它的 2 倍
-        providers: 可选，限定本次使用的提供商子集，如 ["tavily", "brave"]
+        max_results: 每家抓取条数上限，默认 5
+        providers: 显式指定厂商；此时按指定厂商执行，不再自动筛选
+        total_results: 最终交付的页面数，默认 12
+        search_mode: auto（默认）/ free / all
     """
+    mode = (search_mode or SEARCH_MODE).strip().lower()
+    if mode not in ("auto", "free", "all"):
+        return "search_mode 仅支持 auto / free / all"
     per_provider = min(
         max_results if max_results and max_results > 0 else DEFAULT_MAX_RESULTS,
         MAX_RESULTS_CAP,
@@ -108,11 +185,15 @@ async def web_search(
         for name in requested:
             if name not in REGISTRY:
                 errors[name] = f"未知提供商，可选: {', '.join(REGISTRY)}"
+            elif mode == "free" and POOLS.get(name) and POOLS[name].keys:
+                errors[name] = "free 模式禁止使用带 key 的厂商，避免消耗账号积分"
             elif not provider_enabled(name, explicit=True):
                 hint = _UNCONFIGURED_HINT.get(name, f"{name.upper()}_API_KEY")
                 errors[name] = f"未配置（需要 {hint}）"
             else:
                 names.append(name)
+    elif mode in ("auto", "free"):
+        names = [name for name in FREE_PROVIDERS if provider_enabled(name, explicit=True)]
     else:
         names = enabled_search_providers()
     if not names:
@@ -121,8 +202,55 @@ async def web_search(
 
     results, run_errors = await run_search(names, query, per_provider)
     errors.update(run_errors)
-    merged = merge_results(results)[: per_provider * _MERGE_MULTIPLIER]
-    return _format_search(query, merged, results, errors)
+    unique_items = merge_results(results)
+    quality = assess_quality(query, unique_items, errors)
+    phases = [{
+        "stage": "匿名免费" if not requested and mode in ("auto", "free") else "指定/全量",
+        "providers": list(names),
+    }]
+    escalated: list[str] = []
+
+    # 只有 auto 且门禁不足才升级；free 模式永远不调用带 key 的厂商。
+    if mode == "auto" and not requested and not quality.sufficient and AUTO_ESCALATE_MAX > 0:
+        candidates = [
+            name for name in PAID_PROVIDERS
+            if name not in names and provider_enabled(name)
+        ][:AUTO_ESCALATE_MAX]
+        if candidates:
+            extra_results, extra_errors = await run_search(candidates, query, per_provider)
+            errors.update(extra_errors)
+            results.update(extra_results)
+            names.extend(candidates)
+            escalated = candidates
+            phases.append({"stage": "限量积分/免费额度", "providers": candidates})
+            unique_items = merge_results(results)
+            quality = assess_quality(query, unique_items, errors)
+
+    delivered_items, folded = (
+        fold_near_duplicates(unique_items) if NEAR_DEDUP else (unique_items, 0)
+    )
+    limit = total_results if total_results and total_results > 0 else TOTAL_RESULTS
+    merged = delivered_items[:limit]
+    stats = {
+        "attempted": len(names),
+        "succeeded": sum(1 for items in results.values() if items),
+        "empty": sum(1 for items in results.values() if not items),
+        "raw": sum(len(items) for items in results.values()),
+        "unique": len(unique_items),
+        "folded": folded,
+        "omitted_pages": max(0, len(delivered_items) - len(merged)),
+        "quality": quality.as_markdown()
+        + f"\n- 执行模式: **{mode}**；阶段: "
+        + " → ".join(f"{p['stage']}({', '.join(p['providers'])})" for p in phases)
+        + (
+            f"\n- 成本: 第一阶段匿名源不足，追加 {len(escalated)} 个 key 源；未启用其余厂商。"
+            if escalated else
+            "\n- 成本: 仅使用匿名/免费源，本次未消耗任何账号 key 积分。"
+            if mode in ("auto", "free") and not requested else
+            f"\n- 成本: 按 {mode}/指定厂商执行；带 key 的厂商可能消耗账户额度。"
+        ),
+    }
+    return _format_search(query, merged, results, errors, stats)
 
 
 @mcp.tool()
@@ -182,6 +310,12 @@ async def web_status() -> str:
             lines.append(f"- {name}: 未配置（需要 {hint}）")
     lines.append("")
     lines.append(f"### 抓取后端\n- 可选: {', '.join(FETCH_PROVIDERS)}\n- 默认: {DEFAULT_FETCH_PROVIDER}")
+    lines.append(
+        f"\n### 搜索成本模式\n- 默认: {SEARCH_MODE}\n"
+        f"- 匿名优先池: {', '.join(FREE_PROVIDERS)}\n"
+        f"- 自动升级顺序: {', '.join(PAID_PROVIDERS)}（最多 {AUTO_ESCALATE_MAX} 家）\n"
+        "- auto: 匿名源先查，覆盖不足才限量启用 key；free: 禁止 key；all: 全量查询"
+    )
     return "\n".join(lines)
 
 

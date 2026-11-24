@@ -22,11 +22,15 @@ from config import (
 )
 from keypool import KeyPool, _fingerprint
 from providers import (
+    anysearch,
+    baidu,
+    bocha,
     brave,
     duckduckgo,
     exa,
     firecrawl,
     jina,
+    keenable,
     linkup,
     ollama,
     parallel,
@@ -37,12 +41,22 @@ from providers import (
     serper,
     tavily,
     volcengine,
+    youcom,
+    yuanbao,
+    zhipu,
 )
 from providers.base import FetchResult, ProviderError, SearchResult, truncate
 
 # name -> (search_fn | None, fetch_fn | None)
 REGISTRY: dict[str, tuple] = {
     "tavily": (tavily.search, tavily.fetch),
+    "baidu": (baidu.search, None),
+    "bocha": (bocha.search, None),
+    "yuanbao": (yuanbao.search, None),
+    "zhipu": (zhipu.search, None),
+    "anysearch": (anysearch.search, None),
+    "keenable": (keenable.search, keenable.fetch),
+    "youcom": (youcom.search, None),
     "querit": (querit.search, None),
     "firecrawl": (firecrawl.search, firecrawl.fetch),
     "ollama": (ollama.search, ollama.fetch),
@@ -63,10 +77,10 @@ REGISTRY: dict[str, tuple] = {
 # - parallel：官方匿名 MCP，免费且国内直连实测可用，默认启用
 # - duckduckgo / firecrawl 匿名：受 ENABLE_KEYLESS 开关控制，避免超时或重复计费
 # - searxng：填实例地址即启用
-KEYLESS_KNOWN: set[str] = {"parallel", "duckduckgo", "firecrawl"} | (
+KEYLESS_KNOWN: set[str] = {"parallel", "anysearch", "keenable", "youcom", "duckduckgo", "firecrawl"} | (
     {"searxng"} if SEARXNG_BASE_URL else set()
 )
-KEYLESS_ENABLED: set[str] = {"parallel"} | (
+KEYLESS_ENABLED: set[str] = {"parallel", "anysearch", "keenable"} | (
     set(KEYLESS_KNOWN) if ENABLE_KEYLESS else set()
 )
 if SEARXNG_BASE_URL:
