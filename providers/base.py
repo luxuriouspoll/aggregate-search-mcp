@@ -84,6 +84,7 @@ async def post_json(
     payload: dict,
     headers: dict | None = None,
     auth: str = "bearer",
+    timeout: float | None = None,
 ) -> dict:
     """统一的 POST 请求，非 200 一律抛 ProviderError（带 status / retry_after）。
 
@@ -104,7 +105,7 @@ async def post_json(
 
     try:
         resp = await client.post(
-            request_url, json=payload, headers=merged, timeout=SEARCH_TIMEOUT
+            request_url, json=payload, headers=merged, timeout=timeout or SEARCH_TIMEOUT
         )
     except httpx.HTTPError as exc:
         raise ProviderError(f"网络错误: {type(exc).__name__}: {exc}") from exc
@@ -127,6 +128,7 @@ async def get_text(
     key: str = "",
     headers: dict | None = None,
     auth: str = "bearer",
+    timeout: float | None = None,
 ) -> str:
     """GET 文本（Jina reader / SearXNG 之类返回非标准格式的端点）。"""
     merged = dict(headers or {})
@@ -141,7 +143,7 @@ async def get_text(
             sep = "&" if "?" in url else "?"
             request_url = f"{url}{sep}{param}={key}"
     try:
-        resp = await client.get(request_url, headers=merged, timeout=SEARCH_TIMEOUT)
+        resp = await client.get(request_url, headers=merged, timeout=timeout or SEARCH_TIMEOUT)
     except httpx.HTTPError as exc:
         raise ProviderError(f"网络错误: {type(exc).__name__}: {exc}") from exc
     if resp.status_code != 200:

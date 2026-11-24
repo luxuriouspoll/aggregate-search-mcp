@@ -96,19 +96,29 @@ def demo_keypool() -> None:
         kp.KEY_STATE_FILE = Path(tmp) / "state.json"
         kp._CACHE = None
         kp._CACHE_MTIME = -1.0
+        kp._IN_FLIGHT.clear()
         try:
             pool = kp.KeyPool("demo", ["key-one-xxxx", "key-two-yyyy", "key-three-zzzz"])
             first = pool.next_key(set())
             assert first == "key-one-xxxx", first
 
-            # 额度耗尽 → 打冷却，下一次轮询应跳过它
+            # 额度耗尽 → 打冷却，释放后下一次轮询应跳过它
             pool.record_failure(first, 402, "quota exhausted")
-            assert pool.next_key(set()) == "key-two-yyyy"
+            pool.release(first)
+            second = pool.next_key(set())
+            assert second == "key-two-yyyy", second
             assert pool.available() == 2, pool.available()
 
-            # 本次已试过的 key 不再返回
+            # 并发中的 key 不会被另一个请求重复拿到
+            assert pool.next_key(set()) == "key-three-zzzz"
+            pool.release(second)
+            pool.release("key-three-zzzz")
+
+            # 本次已试过的 key 不再返回，另一个 key 已被释放，可继续重试
             fp1 = hashlib.sha256(first.encode()).hexdigest()[:16]
-            assert pool.next_key({fp1}) == "key-two-yyyy"
+            retried = pool.next_key({fp1})
+            assert retried == "key-two-yyyy", retried
+            pool.release(retried)
 
             # 成功清除标记
             pool.record_failure("key-two-yyyy", 402, "quota")
@@ -123,11 +133,13 @@ def demo_keypool() -> None:
             # 全部冷却时 next_key 返回 None，而不是死循环
             pool.record_failure("key-two-yyyy", 402, "quota")
             pool.record_failure("key-three-zzzz", 402, "quota")
+            pool.release("key-three-zzzz")
             assert pool.next_key(set()) is None
         finally:
             kp.KEY_STATE_FILE = saved
             kp._CACHE = None
             kp._CACHE_MTIME = -1.0
+            kp._IN_FLIGHT.clear()
     print("[demo] key 轮询 OK：额度耗尽自动跳过、已试过的 key 不重试、全部冷却时不死循环")
 
 

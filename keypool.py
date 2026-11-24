@@ -96,10 +96,11 @@ class KeyState:
 
 @dataclass
 class KeyPool:
-    """单家的 key 池。keys 顺序即轮询优先级。"""
+    """单家的 key 池，跨请求轮转，而不是每次都用第一个 key。"""
 
     provider: str
     keys: list[str] = field(default_factory=list)
+    _cursor: int = field(default=0, init=False, repr=False)
 
     def __bool__(self) -> bool:
         return bool(self.keys)
@@ -110,22 +111,38 @@ class KeyPool:
     # ---- 轮询 ----
 
     def next_key(self, attempted: set[str] | None = None) -> str | None:
-        """取下一个可用 key：跳过本次已试过的、冷却期内的。
+        """取下一个可用 key：跳过本次已试过、冷却期内和其他请求正在使用的 key。
 
-        优先返回没有失败标记的 key；全部冷却时返回 None。
+        起点在上次选中 key 的后一位，让多个 key 的额度均衡消耗；
+        同一次请求内重试不会重复选同一个 key。
         """
         attempted = attempted or set()
         now = time.time()
-        states = _load_state()
-        for key in self.keys:
-            fp = _fingerprint(key)
-            if fp in attempted:
-                continue
-            state = states.get(self.provider, {}).get(fp)
-            if state and state.active(now):
-                continue
-            return key
+        with _LOCK:
+            states = _load_state()
+            bucket = states.get(self.provider, {})
+            total = len(self.keys)
+            if not total:
+                return None
+            start = self._cursor % total
+            for offset in range(total):
+                index = (start + offset) % total
+                key = self.keys[index]
+                fp = _fingerprint(key)
+                if fp in attempted or fp in _IN_FLIGHT:
+                    continue
+                state = bucket.get(fp)
+                if state and state.active(now):
+                    continue
+                self._cursor = (index + 1) % total
+                _IN_FLIGHT.add(fp)
+                return key
         return None
+
+    def release(self, key: str) -> None:
+        """请求结束后释放 in-flight 标记；冷却状态由 record_failure 另行记录。"""
+        with _LOCK:
+            _IN_FLIGHT.discard(_fingerprint(key))
 
     def available(self) -> int:
         """当前可用（未冷却）的 key 数量。"""
@@ -144,6 +161,7 @@ class KeyPool:
             states[_fingerprint(key)].reset_at
             for key in self.keys
             if _fingerprint(key) in states
+            and states[_fingerprint(key)].reset_at > time.time()
         ]
         return min(resets) if resets else None
 
@@ -184,7 +202,6 @@ class KeyPool:
         total = len(self.keys)
         if not total:
             return "无需 key"
-            return "无 key"
         ok = self.available()
         if ok == total:
             return f"{ok}/{total} 可用"
@@ -199,6 +216,7 @@ class KeyPool:
 # ---- 状态读写 ----
 
 _LOCK = threading.RLock()
+_IN_FLIGHT: set[str] = set()
 _CACHE: dict[str, dict[str, KeyState]] | None = None
 _CACHE_MTIME: float = -1.0
 

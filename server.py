@@ -44,6 +44,10 @@ _UNCONFIGURED_HINT = {
     "firecrawl": "FIRECRAWL_API_KEY",
     "ollama": "OLLAMA_API_KEY",
     "duckduckgo": "无需 key，但需 ENABLE_KEYLESS=true 才默认参与",
+    "parallel": "PARALLEL_API_KEY（可选；匿名也免费）",
+    "serper": "SERPER_API_KEY",
+    "serpapi": "SERPAPI_API_KEY",
+    "linkup": "LINKUP_API_KEY",
 }
 
 
@@ -133,16 +137,29 @@ async def web_fetch(url: str, provider: str = "") -> str:
     name = (provider or DEFAULT_FETCH_PROVIDER).strip().lower()
     if not url.strip().lower().startswith(("http://", "https://")):
         return f"只支持 http/https 链接，收到: {url[:120]}"
-    try:
-        result = await run_fetch(name, url)
-    except ProviderError as exc:
-        return f"抓取失败（{name}）: {exc}"
-    except Exception as exc:
-        # 兜底但不静默：编程错误也要在 stderr 留痕
-        print(f"[aggregate-search] web_fetch 异常: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return f"抓取失败（{name}）: {type(exc).__name__}: {exc}"
-    header = f"# {result.title}\n\n{result.url}\n\n" if result.title else f"{result.url}\n\n"
-    return header + (result.content or "（正文为空）")
+
+    # 显式指定后端时只试这一家；未指定时按顺序回退，某家挂了不至于抓不到正文。
+    if provider.strip():
+        candidates = [name]
+    else:
+        candidates = [name] + [p for p in FETCH_PROVIDERS if p != name and provider_enabled(p, explicit=True)]
+    failures: list[str] = []
+    for candidate in candidates:
+        try:
+            result = await run_fetch(candidate, url)
+        except ProviderError as exc:
+            failures.append(f"{candidate}: {exc}")
+            continue
+        except Exception as exc:
+            print(f"[aggregate-search] web_fetch 异常: {type(exc).__name__}: {exc}", file=sys.stderr)
+            failures.append(f"{candidate}: {type(exc).__name__}: {exc}")
+            continue
+        header = f"# {result.title}\n\n{result.url}\n\n" if result.title else f"{result.url}\n\n"
+        prefix = f"抓取后端: {result.provider}\n\n"
+        if failures:
+            prefix += "已跳过失败后端: " + "；".join(failures) + "\n\n"
+        return prefix + header + (result.content or "（正文为空）")
+    return "抓取失败，已尝试后端：\n- " + "\n- ".join(failures)
 
 
 @mcp.tool()
@@ -153,9 +170,10 @@ async def web_status() -> str:
     """
     lines = ["## 聚合搜索状态", ""]
     lines.append("### 搜索提供商")
+    statuses = pool_status()
     for name in REGISTRY:
         enabled = provider_enabled(name)
-        pool = pool_status().get(name, "")
+        pool = statuses.get(name, "")
         if enabled:
             detail = pool or "免 key"
             lines.append(f"- {name}: 已启用（{detail}）")

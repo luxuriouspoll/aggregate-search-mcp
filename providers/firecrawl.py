@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import httpx
 
+from config import FIRECRAWL_BASE_URL
 from providers.base import FetchResult, ProviderError, SearchResult, as_items, expect_dict, post_json
 
-SEARCH_URL = "https://api.firecrawl.dev/v2/search"
-SCRAPE_URL = "https://api.firecrawl.dev/v2/scrape"
+SEARCH_URL = f"{FIRECRAWL_BASE_URL}/v2/search"
+SCRAPE_URL = f"{FIRECRAWL_BASE_URL}/v2/scrape"
 
 
 def _check(data: dict) -> dict:

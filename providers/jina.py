@@ -1,66 +1,68 @@
 """Jina（https://jina.ai）
 
-搜索: GET https://s.jina.ai/<query>      头: Authorization: Bearer
-      -> 纯文本搜索结果（不是 JSON），按空行分段
-抓取: GET https://r.jina.ai/<url>        头: Authorization: Bearer
+搜索: GET https://s.jina.ai/<query>  Accept: application/json
+      -> data[]: {title, url, description, content, publishedTime}
+抓取: GET https://r.jina.ai/<url>    Accept: text/plain
       -> Markdown 正文
 
-Jina 的两条端点都返回文本，格式不稳定，故按行做宽松解析；
-无 key 时匿名访问有时可用，但 IP 信誉差会被 401 拦。
+搜索返回完整正文，单条可能有数万字符；聚合搜索只保留短摘要，
+需要全文时再用 web_fetch 指定 jina。
 """
 from __future__ import annotations
 
+import json
 import re
 from urllib.parse import quote
 
 import httpx
 
-from providers.base import FetchResult, ProviderError, SearchResult, get_text
+from providers.base import (
+    FetchResult,
+    ProviderError,
+    SearchResult,
+    as_items,
+    expect_dict,
+    get_text,
+)
 
 SEARCH_BASE = "https://s.jina.ai/"
 READER_BASE = "https://r.jina.ai/"
-
-# 形如 "Title: xxx" / "URL Source: https://..." 的头部块
 _TITLE_RE = re.compile(r"^Title:\s*(.+)$", re.M)
-_URL_RE = re.compile(r"^(?:URL Source|URL):\s*(\S+)$", re.M)
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
     text = await get_text(
         client,
-        f"{SEARCH_BASE}{quote(query, safe="")}",
+        f"{SEARCH_BASE}{quote(query, safe='')}",
         key=key,
-        headers={"Accept": "text/plain", "X-Return-Format": "markdown"},
+        headers={"Accept": "application/json"},
+        timeout=45,
     )
-    if not text.strip():
-        raise ProviderError("返回内容为空")
+    try:
+        data = expect_dict(json.loads(text), "jina")
+    except ValueError as exc:
+        raise ProviderError(f"响应不是 JSON: {text[:200]}") from exc
 
-    # Jina 搜索结果用 "N. Title" 或 "## Title" 分块，取每块的标题与 URL
-    blocks = [b for b in re.split(r"\n(?=\d+\.\s|##\s)", text) if b.strip()]
     results: list[SearchResult] = []
-    for block in blocks:
-        url_match = _URL_RE.search(block)
-        title_match = _TITLE_RE.search(block) or re.match(r"^\s*(?:\d+\.\s+|##\s*)(.+)$", block)
-        if not url_match:
-            continue
-        url = url_match.group(1).strip()
+    for item in as_items(data, "data"):
+        url = str(item.get("url") or item.get("finalUrl") or "").strip()
         if not url.startswith(("http://", "https://")):
             continue
-        title = (title_match.group(1).strip() if title_match else url)[:200]
-        # 去掉头部元信息，剩下的当摘要
-        body = _TITLE_RE.sub("", _URL_RE.sub("", block)).strip()
+        description = str(item.get("description") or "").strip()
+        content = str(item.get("content") or "").strip()
+        snippet = description or re.sub(r"\s+", " ", content)[:600]
         results.append(
             SearchResult(
                 source="jina",
                 url=url,
-                title=title,
-                snippet=body.replace("\n", " ").strip()[:600],
+                title=str(item.get("title") or "").strip(),
+                snippet=snippet[:600],
                 rank=len(results),
+                published=str(item.get("publishedTime") or item.get("date") or ""),
             )
         )
         if len(results) >= max_results:
             break
-    # 解析出 0 条可能是真的没结果，不当作错误（只记空列表）
     return results
 
 

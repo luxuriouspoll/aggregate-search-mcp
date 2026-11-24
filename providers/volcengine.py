@@ -55,8 +55,15 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
         err = meta["Error"]
         code = str(err.get("Code", ""))
         msg = str(err.get("Message", ""))
+        lowered = f"{code} {msg}".lower()
+        status = 429 if code == "10408" or "rate" in lowered else 0
+        if status == 0 and any(h in lowered for h in ("quota", "额度", "credit", "insufficient", "10406")):
+            status = 402
+        if status == 0 and any(h in lowered for h in ("api key", "apikey", "unauthorized", "forbidden")):
+            status = 401
         raise ProviderError(
             f"业务错误 {code}: {msg}",
+            status=status,
             retryable=_is_key_or_quota_error(code, msg),
         )
 

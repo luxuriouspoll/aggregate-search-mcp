@@ -95,7 +95,10 @@ _KEY_ENV_NAMES: dict[str, list[str]] = {
     "perplexity": ["PERPLEXITY_API_KEYS", "PERPLEXITY_API_KEY", "PPLX_API_KEYS", "PPLX_API_KEY"],
     "volcengine": ["VOLCENGINE_API_KEYS", "VOLCENGINE_API_KEY", "WEB_SEARCH_API_KEYS", "WEB_SEARCH_API_KEY"],
     "searxng": ["SEARXNG_API_KEYS", "SEARXNG_API_KEY"],
-    "apify": ["APIFY_API_KEYS", "APIFY_API_KEY", "APIFY_TOKEN"],
+    "parallel": ["PARALLEL_API_KEYS", "PARALLEL_API_KEY"],
+    "serper": ["SERPER_API_KEYS", "SERPER_API_KEY"],
+    "serpapi": ["SERPAPI_API_KEYS", "SERPAPI_API_KEY"],
+    "linkup": ["LINKUP_API_KEYS", "LINKUP_API_KEY"],
 }
 
 
@@ -114,10 +117,13 @@ def _load_keys_json() -> dict[str, list[str]]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        print("[aggregate-search] keys.json 顶层必须是对象，已忽略", file=sys.stderr)
         return {}
     result: dict[str, list[str]] = {}
-    for name, value in (data or {}).items():
+    for name, value in data.items():
         if isinstance(value, str):
             value = _split(value)
         if isinstance(value, list):
@@ -160,30 +166,32 @@ FIRECRAWL_BASE_URL: str = (
 )
 
 # 无 key 也能用（但需要上面的实例地址）
-KEYLESS_PROVIDERS: set[str] = {"searxng"}
+KEYLESS_PROVIDERS: set[str] = {"searxng", "parallel"}
 
 # 可选：SEARCH_PROVIDERS=tavily,querit —— 在已配 key 的基础上再限定默认启用子集
 _raw = os.environ.get("SEARCH_PROVIDERS", "")
-SEARCH_PROVIDERS_LIMIT: list[str] | None = (
-    [p.strip().lower() for p in _raw.split(",") if p.strip()] or None
-)
+SEARCH_PROVIDERS_LIMIT: list[str] | None = _split(_raw) or None
 
-# 可选：抓取后端 tavily | firecrawl | ollama | jina | exa，默认 tavily
+# 可选：抓取后端 tavily | firecrawl | ollama | jina | exa | parallel，默认 tavily
 DEFAULT_FETCH_PROVIDER: str = os.environ.get("WEB_FETCH_PROVIDER", "tavily").strip().lower()
 
-# 可选：HTTP 代理（DuckDuckGo 等境外免 key 源在国内直连不通，需走代理）
-SEARCH_PROXY: str = (
-    os.environ.get("SEARCH_PROXY") or os.environ.get("HTTPS_PROXY") or ""
-).strip()
+# 可选：HTTP 代理。默认只让明确标注为境外/国内直连不稳的源走代理，
+# 避免把国内源的请求和密钥都绕到代理。设 SEARCH_PROXY_ALL=true 可全局使用。
+SEARCH_PROXY: str = os.environ.get("SEARCH_PROXY", "").strip()
+SEARCH_PROXY_ALL: bool = os.environ.get("SEARCH_PROXY_ALL", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# 这些源在实测中国内直连不稳；可按自己的网络情况用 PROXY_PROVIDERS 覆盖
+PROXY_PROVIDERS: set[str] = set(
+    _split(os.environ.get("PROXY_PROVIDERS", "jina,duckduckgo"))
+)
 
 # 免 key 来源是否默认参与聚合搜索。
-# DuckDuckGo 在国内直连超时（要配 SEARCH_PROXY 才稳），默认关闭避免拖慢每次搜索。
-# 设置 ENABLE_KEYLESS=true 可重新打开。
+# Parallel 官方匿名 MCP 免费且直连可用，始终默认启用。
+# DuckDuckGo 国内直连超时，Firecrawl 匿名与付费可能重复，因此这两家受开关控制。
+# 设置 ENABLE_KEYLESS=true 可启用全部免 key 源。
 ENABLE_KEYLESS: bool = os.environ.get("ENABLE_KEYLESS", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
+    "1", "true", "yes", "on",
 )
 
 def _env_number(raw_name: str, default, cast, minimum=None):
