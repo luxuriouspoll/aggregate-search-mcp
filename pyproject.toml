@@ -1,0 +1,16 @@
+[project]
+name = "aggregate-search-mcp"
+version = "0.2.0"
+description = "聚合 Tavily/火山/Querit/Firecrawl/Ollama/Brave/Exa/Jina/Perplexity/SearXNG/DuckDuckGo 的搜索与抓取 MCP Server（多 key 轮询 + 跨家去重）"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0,<2",  # 2.x 把 FastMCP 改名为 MCPServer，v1 API 最稳定、文档最全
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["providers"]
