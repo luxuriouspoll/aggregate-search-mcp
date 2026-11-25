@@ -8,7 +8,7 @@
 - 运行环境：Python 3.10+
 - 依赖：`mcp>=1.2,<2`、`httpx`
 - 工具：`web_search`、`web_fetch`、`web_status`
-- 适配器：22 家搜索服务（是否可用取决于网络、key、额度和上游服务）
+- 适配器：19 家搜索服务（是否可用取决于网络、key、额度和上游服务）
 - 密钥：仅本机配置，仓库不包含真实 key
 
 > 免费额度与价格会变化。本文档的免费信息基于 2026-11-25 检索到的官方页面，注册前请再次以厂商控制台为准。
@@ -36,11 +36,11 @@
   ↓
 Parallel + Keenable + AnySearch 匿名搜索
   ↓
-本地质量门禁：相关页面数、证据数量、跨源共识、复杂查询三源共识
+本地质量门禁：相关页面数、证据数量、跨源共识、官方一手来源
   ↓
 覆盖充足？
   ├─ 是：不再调用任何 key 厂商
-  └─ 否：追加 3 个不同厂商（默认火山、Querit、Tavily）
+  └─ 否：按国内/国际/混合实体，追加 3 个不同厂商
              ↓
         URL 归一化与去重、近似转载折叠、多来源证据汇总
              ↓
@@ -53,6 +53,7 @@ Parallel + Keenable + AnySearch 匿名搜索
 
 - 匿名搜索优先，降低账号积分消耗。
 - 覆盖不足时追加 **3 个不同厂商**，不是用同一家的 3 个 key 凑数。
+- **地域软路由**：只调整第二阶段补源顺序；国内优先国内源、国际优先国际源、跨地区混排，不过滤任何地区的信息。
 - 同一家可保存多个 key，跨请求均衡轮转；失效、限流、额度耗尽自动切换。
 - 同一 URL 聚合多个来源和摘要；近似转载折叠但保留 URL 和证据关联。
 - 版本号、日期、金额等关键数字不同，禁止误合并。
@@ -69,6 +70,23 @@ Parallel + Keenable + AnySearch 匿名搜索
 | `all` | 并发查询全部已启用厂商 | 各厂商按账号规则消耗额度 |
 
 显式 `providers` 时按用户指定厂商执行；`free` 的禁止 key 约束仍然优先。
+
+### 地域软路由（不是硬分流）
+
+第一阶段始终使用匿名混合搜索，不因中文或英文限制信息来源。只有需要补搜时，才根据问题里的明确地域实体调整顺序：
+
+| 问题类型 | 示例 | 默认补源顺序 |
+|---|---|---|
+| 国内 | `中国最新的人工智能政策` | 百度千帆、火山引擎、Querit |
+| 国际 | `OpenAI 最新 API 价格` | Tavily、Exa、Firecrawl |
+| 跨地区 | `中美云计算政策对比` | 百度千帆、Tavily、火山引擎（混排） |
+| 无明确地域 | 通用问题 | 火山引擎、Querit、Tavily |
+
+**不会按地区过滤结果。**中文提问不自动等于国内信息；国内平台也可能返回国际技术文档，国际平台同样可能有优质中文资料。这样避免硬分流导致证据缺失。
+
+复杂查询除三源共识外，也接受官方一手来源作为补充证据；官方网站只是原始出处提示，最终仍由 Agent 审核内容、日期与问题匹配度。
+
+可用 `REGION_ROUTING=off` 关闭地域排序，或设 `cn` / `global` 手动指定补源偏好。
 
 ## 安装与启动
 
@@ -109,7 +127,7 @@ cp .env.example .env
 | 厂商 | 官方注册 / key / 文档地址 | 免费口径 | 环境变量 | 实测状态 |
 |---|---|---|---|---|
 | **腾讯元宝搜索** | [服务 API KEY 开通与创建](https://cloud.tencent.com/document/product/1806/130615) · [API 接入指南](https://cloud.tencent.com/document/product/1806/130616) | 新接入用户每月有免费搜索额度，以控制台活动为准 | `TENCENTCLOUD_WSA_APIKEY` | 已按官方文档接入，待 key 实测 |
-| **百度千帆搜索** | [千帆 API Key 控制台](https://console.bce.baidu.com/qianfan/ais/console/apiKey) · [搜索接入指南](https://cloud.baidu.com/doc/qianfan/s/nmweljpt3) · [计费与免费额度](https://ai.baidu.com/ai-doc/AppBuilder/Imca18xc6) | 官方页面当前写明每日免费 100 次，默认优先抵扣；以控制台为准 | `BAIDU_API_KEY` | 已按官方文档接入，待 key 实测 |
+| **百度千帆搜索** | [千帆 API Key 控制台](https://console.bce.baidu.com/qianfan/ais/console/apiKey) · [搜索接入指南](https://cloud.baidu.com/doc/qianfan/s/nmweljpt3) · [计费与免费额度](https://ai.baidu.com/ai-doc/AppBuilder/Imca18xc6) | 官方页面当前写明每日免费 100 次，默认优先抵扣；以控制台为准 | `BAIDU_API_KEY` | 已实测 |
 | **智谱** | [联网搜索文档](https://docs.bigmodel.cn/cn/guide/tools/web-search) · [开放平台](https://open.bigmodel.cn/) | 搜索按次计费；赠送模型 token 不等于免费搜索 | `ZHIPU_API_KEY` | 已按官方文档接入，待 key 实测 |
 | **博查** | [开放平台与控制台](https://open.bochaai.com/) | 以控制台额度和当前价格为准 | `BOCHA_API_KEY` | 已按官方文档接入，待 key 实测 |
 | **火山引擎** | [联网搜索 API Key 控制台](https://console.volcengine.com/search-infinity/api-key) | 每月有免费额度，以控制台为准 | `VOLCENGINE_API_KEY` | 已实测 |
@@ -127,9 +145,6 @@ cp .env.example .env
 | **Firecrawl** | [API Keys](https://www.firecrawl.dev/app/api-keys) | 有免费额度；也支持匿名按 IP 限额 | `FIRECRAWL_API_KEY(S)` | ✅ | ✅ |
 | **Querit** | [官网](https://www.querit.ai) | 以账户页面为准 | `QUERIT_API_KEY(S)` | ✅ | ❌ |
 | **You.com** | [API Keys](https://you.com/platform/api-keys) | 匿名免费档有限额，国内可能需代理 | `YDC_API_KEY`（可选） | ✅ | ❌ |
-| **Serper** | [官网](https://serper.dev/) | 注册一次性免费查询额度 | `SERPER_API_KEY(S)` | ✅ | ❌ |
-| **SerpApi** | [价格与注册](https://serpapi.com/pricing) | 每月有免费查询额度 | `SERPAPI_API_KEY(S)` | ✅ | ❌ |
-| **Linkup** | [价格与注册](https://www.linkup.so/pricing) | 有免费试用额度 | `LINKUP_API_KEY(S)` | ✅ | ❌ |
 | **Ollama** | [云端 Keys](https://ollama.com/settings/keys) | 以账户页面为准；不是本地 11434 | `OLLAMA_API_KEY(S)` | ✅ | ✅ |
 | **Brave** | [API Dashboard](https://api-dashboard.search.brave.com/app/keys) | 原免费计划已调整；绑卡和计费以官网为准 | `BRAVE_API_KEY(S)` | ✅ | ❌ |
 | **Perplexity** | [API 价格](https://docs.perplexity.ai/docs/getting-started/pricing) | 无通用免费 API 套餐 | `PERPLEXITY_API_KEY(S)` | ✅ | ❌ |
@@ -285,7 +300,10 @@ JINA_API_KEYS=jina_your-first-key,jina_your-second-key
 | `AUTO_ESCALATE_MAX` | `3` | 不足时追加的不同厂商数，设 0 禁止升级 |
 | `AUTO_MIN_RESULTS` | `4` | 最少原始证据数 |
 | `AUTO_MIN_UNIQUE` | `3` | 最少相关独立页面数 |
-| `AUTO_MIN_CONSENSUS` | `1` | 复杂查询最少三源共识页面数 |
+| `AUTO_MIN_CONSENSUS` | `1` | 复杂查询最少三源共识页面数；官方一手来源可作为补充证据 |
+| `REGION_ROUTING` | `auto` | 补源地域软路由：auto / off / cn / global；不过滤结果 |
+| `DOMESTIC_PROVIDERS` | `baidu,volcengine,querit,...` | 国内优先补源列表 |
+| `GLOBAL_PROVIDERS` | `tavily,exa,firecrawl,jina` | 国际优先补源列表 |
 
 ### 搜索、抓取与网络
 
@@ -324,7 +342,7 @@ python check_providers.py --fetch https://example.com tavily
 ```
 
 - **auto 没有追加 key**：匿名结果已达到本地覆盖门禁，属正常节省行为。
-- **复杂查询追加 3 家**：匿名结果缺少三源共识，系统按设计补搜；仍不足时会返回缺口，不会自动烧完所有厂商。
+- **复杂查询追加 3 家**：匿名结果缺少三源共识和官方一手来源，系统按设计补搜；仍不足时会返回缺口，不会自动烧完所有厂商。
 - **某家失败**：查看结果末尾错误与 `web_status`；401/402/403/429 分别检查 key、余额、权限、限流。
 - **Jina 慢**：其搜索返回全文，超时比普通搜索长；可按源配置代理。
 - **DuckDuckGo 202/超时**：非官方端点反爬或网络问题，建议使用 Parallel/Keenable/AnySearch。
@@ -337,7 +355,8 @@ python check_providers.py --fetch https://example.com tavily
 server.py                 MCP 工具、成本模式、统一交付
 config.py                 key、网络与门禁配置
 keypool.py                多 key 轮转、并发占用、冷却状态
-quality.py                覆盖度与三源共识门禁
+quality.py                覆盖度、三源共识与官方来源门禁
+routing.py                国内/国际/混合实体识别与补源软路由
 check_providers.py        离线自测与联网自检
 providers/
   base.py                 HTTP/MCP 解码、URL 归一化、证据合并

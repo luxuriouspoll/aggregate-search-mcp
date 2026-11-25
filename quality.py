@@ -13,6 +13,7 @@ from config import (
     AUTO_MIN_RESULTS,
     AUTO_MIN_UNIQUE,
     COMPLEX_QUERY_PATTERNS,
+    OFFICIAL_SOURCE_DOMAINS,
 )
 
 _STOPWORDS = {
@@ -83,6 +84,15 @@ class QualityReport:
         return "\n".join(lines)
 
 
+def _official_hits(items: list[dict]) -> int:
+    count = 0
+    for item in items:
+        host = item.get("url", "").split("/")[2].casefold() if "://" in item.get("url", "") else ""
+        if any(host == domain or host.endswith("." + domain) for domain in OFFICIAL_SOURCE_DOMAINS):
+            count += 1
+    return count
+
+
 def assess_quality(query: str, items: list[dict], errors: dict | None = None) -> QualityReport:
     errors = errors or {}
     relevant = _relevant_items(query, items)
@@ -91,12 +101,14 @@ def assess_quality(query: str, items: list[dict], errors: dict | None = None) ->
     consensus = sum(1 for item in relevant if item.get("source_count", 0) >= 2)
     strong_consensus = sum(1 for item in relevant if item.get("source_count", 0) >= 3)
     sources = len({source for item in relevant for source in item.get("sources", [])})
+    official_hits = _official_hits(relevant)
     complex_query = is_complex_query(query)
     metrics = {
         "相关独立页面": unique,
         "原始证据": raw,
         "跨源共识页面": consensus,
         "三源共识页面": strong_consensus,
+        "官方一手来源": official_hits,
         "有效厂商": sources,
         "复杂查询": "是" if complex_query else "否",
     }
@@ -107,8 +119,8 @@ def assess_quality(query: str, items: list[dict], errors: dict | None = None) ->
         gaps.append(f"相关独立页面不足（{unique}/{AUTO_MIN_UNIQUE}）")
     if raw < AUTO_MIN_RESULTS:
         gaps.append(f"有效证据数量不足（{raw}/{AUTO_MIN_RESULTS}）")
-    if complex_query and strong_consensus < max(1, AUTO_MIN_CONSENSUS):
-        gaps.append(f"复杂/时效性查询缺少 3 家不同厂商的共同证据（{strong_consensus} 个页面）")
+    if complex_query and strong_consensus < max(1, AUTO_MIN_CONSENSUS) and official_hits < 1:
+        gaps.append(f"复杂/时效性查询既无三源共识，也无官方一手来源（{strong_consensus} 个三源页面）")
     if not relevant and items:
         gaps.append("返回内容与查询关键词匹配度低")
     if not items:
@@ -122,6 +134,8 @@ def assess_quality(query: str, items: list[dict], errors: dict | None = None) ->
         reasons.append("独立页面和证据数量达到门槛")
         if consensus:
             reasons.append(f"有 {consensus} 个页面获得多家来源交叉命中")
+        if official_hits:
+            reasons.append(f"有 {official_hits} 个官方一手来源，可作为三源共识的补充证据")
         return QualityReport(True, "覆盖度足够，待 Agent 语义复核", reasons, [], metrics)
 
     # 接近门槛但已有交叉证据时标为边界情况，由 Agent 决定是否值得花积分。

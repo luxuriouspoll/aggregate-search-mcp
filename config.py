@@ -96,9 +96,6 @@ _KEY_ENV_NAMES: dict[str, list[str]] = {
     "volcengine": ["VOLCENGINE_API_KEYS", "VOLCENGINE_API_KEY", "WEB_SEARCH_API_KEYS", "WEB_SEARCH_API_KEY"],
     "searxng": ["SEARXNG_API_KEYS", "SEARXNG_API_KEY"],
     "parallel": ["PARALLEL_API_KEYS", "PARALLEL_API_KEY"],
-    "serper": ["SERPER_API_KEYS", "SERPER_API_KEY"],
-    "serpapi": ["SERPAPI_API_KEYS", "SERPAPI_API_KEY"],
-    "linkup": ["LINKUP_API_KEYS", "LINKUP_API_KEY"],
     "anysearch": ["ANYSEARCH_API_KEYS", "ANYSEARCH_API_KEY"],
     "keenable": ["KEENABLE_API_KEYS", "KEENABLE_API_KEY"],
     "youcom": ["YDC_API_KEYS", "YDC_API_KEY", "YOUCOM_API_KEYS", "YOUCOM_API_KEY"],
@@ -243,10 +240,34 @@ FREE_PROVIDERS: list[str] = _split(
 PAID_PROVIDERS: list[str] = _split(
     os.environ.get("PAID_PROVIDERS", "volcengine,querit,tavily,exa,firecrawl,jina,yuanbao,baidu,zhipu,bocha")
 )
+# 地区只影响第二阶段补源顺序，不过滤第一阶段或最终结果中的跨地区信息。
+# auto：根据问题中的地域实体选择；off：沿用 PAID_PROVIDERS；cn/global：手动指定。
+REGION_ROUTING: str = os.environ.get("REGION_ROUTING", "auto").strip().lower()
+DOMESTIC_PROVIDERS: list[str] = _split(os.environ.get(
+    "DOMESTIC_PROVIDERS", "baidu,volcengine,querit,yuanbao,zhipu,bocha"
+))
+GLOBAL_PROVIDERS: list[str] = _split(os.environ.get(
+    "GLOBAL_PROVIDERS", "tavily,exa,firecrawl,jina"
+))
+# 只把明确的地域实体作为信号，不能把中文提问等同于国内信息。
+DOMESTIC_QUERY_TERMS: list[str] = _split(os.environ.get(
+    "DOMESTIC_QUERY_TERMS",
+    "中国,国内,大陆,中美,北京,上海,广州,深圳,杭州,成都,重庆,武汉,西安,南京,天津,苏州,国务院,工信部,发改委,国产,人民币,沪深,A股,微信,支付宝,淘宝,天猫,京东,抖音,快手,B站,哔哩哔哩,知乎,小红书,百度,阿里,腾讯,字节跳动,华为,小米,比亚迪,宁德时代",
+))
+GLOBAL_QUERY_TERMS: list[str] = _split(os.environ.get(
+    "GLOBAL_QUERY_TERMS",
+    "美国,中美,英国,加拿大,欧洲,欧盟,日本,韩国,新加坡,印度,澳大利亚,俄罗斯,美元,美股,纳斯达克,硅谷,OpenAI,Anthropic,Google,Microsoft,Meta,NVIDIA,Apple,Amazon,Tesla,GitHub,Linux,Kubernetes,Docker,React,Vue,Python,Java,Rust,Go,Node.js,AWS,Azure,GCP,Cloudflare",
+))
 AUTO_ESCALATE_MAX: int = _env_number("AUTO_ESCALATE_MAX", 3, int, minimum=0)
 AUTO_MIN_RESULTS: int = _env_number("AUTO_MIN_RESULTS", 4, int, minimum=1)
 AUTO_MIN_UNIQUE: int = _env_number("AUTO_MIN_UNIQUE", 3, int, minimum=1)
 AUTO_MIN_CONSENSUS: int = _env_number("AUTO_MIN_CONSENSUS", 1, int, minimum=0)
+# 官方一手事实源可作为三源共识的替代证据，只用于政策/价格/文档类查询。
+# 域名是提示而非事实证明，Agent 仍需审核页面内容和时间。
+OFFICIAL_SOURCE_DOMAINS: list[str] = _split(os.environ.get(
+    "OFFICIAL_SOURCE_DOMAINS",
+    "gov.cn,miit.gov.cn,ndrc.gov.cn,openai.com,developers.openai.com,platform.openai.com,anthropic.com,modelcontextprotocol.io,kubernetes.io,learn.microsoft.com,cloud.google.com,docs.python.org,developer.mozilla.org",
+))
 # 含比较、最新、价格、政策、多实体等语义时提高门禁，不能仅凭结果数量直接交付。
 COMPLEX_QUERY_PATTERNS: list[str] = _split(os.environ.get(
     "COMPLEX_QUERY_PATTERNS",

@@ -38,6 +38,7 @@ from providers import (
 )
 from providers.base import ProviderError, fold_near_duplicates, merge_results
 from quality import assess_quality
+from routing import escalation_providers
 
 mcp = FastMCP("aggregate-search")
 
@@ -55,9 +56,6 @@ _UNCONFIGURED_HINT = {
     "ollama": "OLLAMA_API_KEY",
     "duckduckgo": "无需 key，但需 ENABLE_KEYLESS=true 才默认参与",
     "parallel": "PARALLEL_API_KEY（可选；匿名也免费）",
-    "serper": "SERPER_API_KEY",
-    "serpapi": "SERPAPI_API_KEY",
-    "linkup": "LINKUP_API_KEY",
     "anysearch": "ANYSEARCH_API_KEY（可选；匿名也免费）",
     "keenable": "KEENABLE_API_KEY（可选；匿名也免费）",
     "youcom": "YDC_API_KEY（可选；匿名免费档需代理时配置 SEARCH_PROXY）",
@@ -209,13 +207,15 @@ async def web_search(
         "providers": list(names),
     }]
     escalated: list[str] = []
+    region_reason = ""
 
     # 只有 auto 且门禁不足才升级；free 模式永远不调用带 key 的厂商。
     if mode == "auto" and not requested and not quality.sufficient and AUTO_ESCALATE_MAX > 0:
-        candidates = [
-            name for name in PAID_PROVIDERS
-            if name not in names and provider_enabled(name)
-        ][:AUTO_ESCALATE_MAX]
+        candidates, decision = escalation_providers(query, names, AUTO_ESCALATE_MAX)
+        candidates = [name for name in candidates if provider_enabled(name)]
+        region_reason = decision.reason
+        if decision.matched_terms:
+            region_reason += "（" + "、".join(decision.matched_terms) + "）"
         if candidates:
             extra_results, extra_errors = await run_search(candidates, query, per_provider)
             errors.update(extra_errors)
@@ -242,6 +242,7 @@ async def web_search(
         "quality": quality.as_markdown()
         + f"\n- 执行模式: **{mode}**；阶段: "
         + " → ".join(f"{p['stage']}({', '.join(p['providers'])})" for p in phases)
+        + (f"\n- 补源路由: {region_reason}" if region_reason else "")
         + (
             f"\n- 成本: 第一阶段匿名源不足，追加 {len(escalated)} 个 key 源；未启用其余厂商。"
             if escalated else

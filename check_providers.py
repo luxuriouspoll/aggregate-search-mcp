@@ -307,6 +307,25 @@ async def demo_cost_modes() -> None:
     print("[demo] 成本模式 OK：门禁通过不升级、不足追加 3 个不同厂商、free 禁止 key")
 
 
+def demo_region_routing() -> None:
+    """地域只影响补源顺序，不做硬分流。"""
+    from routing import detect_region, escalation_providers
+
+    cases = [
+        ("中国最新的人工智能政策", "domestic", ["baidu", "volcengine", "querit"]),
+        ("OpenAI 最新 API 价格", "global", ["tavily", "exa", "firecrawl"]),
+        ("中美云计算政策对比", "mixed", ["baidu", "tavily", "volcengine"]),
+    ]
+    for query, region, expected in cases:
+        decision = detect_region(query)
+        assert decision.region == region, (query, decision)
+        selected, _ = escalation_providers(query, ["parallel", "keenable", "anysearch"], 3)
+        assert selected == expected, (query, selected)
+        assert len(set(selected)) == 3
+    assert detect_region("MCP 协议是什么").region == "auto"
+    print("[demo] 地域软路由 OK：国内/国际/混合补源、通用问题不误判")
+
+
 async def main() -> None:
     # Windows 控制台/管道默认 GBK，统一为 UTF-8 避免中文乱码
     for stream in (sys.stdout, sys.stderr):
@@ -317,6 +336,7 @@ async def main() -> None:
         demo_merge()
         demo_keypool()
         await demo_cost_modes()
+        demo_region_routing()
         return
     if argv and argv[0] == "--status":
         show_status()
