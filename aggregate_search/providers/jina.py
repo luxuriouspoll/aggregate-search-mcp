@@ -17,15 +17,17 @@ from urllib.parse import quote
 
 import httpx
 
-from ..config import SEARCH_TIMEOUT
+from ..config import get_settings
 from .base import (
     FetchResult,
     ProviderError,
     SearchResult,
     as_items,
     brief,
+    date_metadata,
     expect_dict,
     get_text,
+    text_of,
 )
 
 SEARCH_BASE = "https://s.jina.ai/"
@@ -40,7 +42,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
         key=key,
         headers={"Accept": "application/json", "X-Respond-With": "no-content"},
         # 走代理时首包偏慢，给得比普通源宽一点
-        timeout=max(SEARCH_TIMEOUT, 25),
+        timeout=max(get_settings().SEARCH_TIMEOUT, 25),
     )
     try:
         data = expect_dict(json.loads(text), "jina")
@@ -62,7 +64,8 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
                 title=str(item.get("title") or "").strip(),
                 snippet=snippet[:600],
                 rank=len(results),
-                published=str(item.get("publishedTime") or item.get("date") or ""),
+                published=text_of(item.get("publishedTime")),
+                dates=date_metadata(source_date=item.get("date")),
             )
         )
         if len(results) >= max_results:

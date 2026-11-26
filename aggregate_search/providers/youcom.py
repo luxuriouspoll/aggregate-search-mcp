@@ -14,6 +14,7 @@ from .base import (
     ProviderError,
     SearchResult,
     brief,
+    date_metadata,
     get_text,
     post_json,
     strict_items,
@@ -70,7 +71,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
             title=text_of(item.get("title")),
             snippet=_snippets(item)[:900],
             rank=len(results),
-            published=text_of(item.get("page_age") or item.get("date")),
+            dates=date_metadata(page_age=item.get("page_age"), source_date=item.get("date")),
         ))
         if len(results) >= max_results:
             break

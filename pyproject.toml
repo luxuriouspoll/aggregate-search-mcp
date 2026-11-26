@@ -3,11 +3,11 @@ name = "aggregate-search-mcp"
 dynamic = ["version"]
 description = "聚合联网搜索 MCP：匿名源优先、不足再补 3 个不同厂商、同厂商多 key 轮转、跨厂商去重与证据汇总"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 keywords = ["mcp", "search", "web-search", "tavily", "exa", "llm", "agent"]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -32,7 +32,7 @@ aggregate-search = "aggregate_search.cli:main"
 aggregate-search-mcp = "aggregate_search.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -43,4 +43,4 @@ packages = ["aggregate_search", "aggregate_search.providers", "aggregate_search.
 version = { attr = "aggregate_search.__version__" }
 
 [tool.setuptools.package-data]
-aggregate_search = ["templates/*"]
+aggregate_search = ["templates/env.example", "templates/keys.example.json"]

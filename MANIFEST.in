@@ -1,0 +1,5 @@
+include CHANGELOG.md docs/usage-guide.md
+recursive-include aggregate_search/templates *.example *.example.json
+prune .venv
+prune .git
+global-exclude .env .env.* keys.json state.db state.db-* usage.jsonl usage.jsonl.* key-state.json* usage-counters.json* *.pyc

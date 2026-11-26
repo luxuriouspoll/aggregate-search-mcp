@@ -2,12 +2,10 @@
 
 搜索: POST https://api.perplexity.ai/chat/completions
       body: {model, messages, return_citations, ...}
-      -> choices[0].message.content（答案）+ citations[]（引用 URL 列表）
+      -> choices[0].message.content（答案）+ search_results[] / citations[]（独立网页）
 
-Perplexity 只给「答案 + 引用链接」，没有逐条标题/摘要，因此：
-- 把答案正文作为第 0 条结果（source=perplexity，url 取第一条引用或搜索页）
-- 每个引用 URL 各生成一条结果，snippet 留空，由其他家补全
-这样在多源合并里它既贡献独家原文，也不会把别人的摘要冲掉。
+答案作为独立摘要，不给它冒用引用网页的 URL 或日期；网页优先使用有元数据的
+search_results，旧版 citations 仅补没有重复的引用 URL。
 """
 from __future__ import annotations
 
@@ -21,7 +19,9 @@ from .base import (
     as_dict,
     as_items,
     brief,
+    date_metadata,
     post_json,
+    query_with_sites,
     text_of,
     wants_domains,
     wants_time,

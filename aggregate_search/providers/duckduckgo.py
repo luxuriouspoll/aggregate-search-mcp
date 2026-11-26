@@ -14,7 +14,7 @@ from urllib.parse import unquote
 
 import httpx
 
-from ..config import SEARCH_TIMEOUT
+from ..config import get_settings
 from .base import NETWORK_ERROR, ProviderError, SearchResult, brief
 
 SEARCH_URL = "https://html.duckduckgo.com/html/"
@@ -59,7 +59,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
                 "Accept": "text/html,application/xhtml+xml",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             },
-            timeout=SEARCH_TIMEOUT,
+            timeout=get_settings().SEARCH_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         raise ProviderError(f"{NETWORK_ERROR}: {type(exc).__name__}: {exc}") from exc

@@ -5,7 +5,7 @@ import re
 
 import httpx
 
-from ..config import FETCH_MAX_CHARS, SEARCH_TIMEOUT
+from ..config import get_settings
 from .base import (
     NETWORK_ERROR,
     FetchResult,
@@ -37,7 +37,7 @@ async def _call(client: httpx.AsyncClient, key: str, tool: str, arguments: dict)
                 "method": "tools/call",
                 "params": {"name": tool, "arguments": arguments},
             },
-            timeout=max(SEARCH_TIMEOUT, 25),
+            timeout=max(get_settings().SEARCH_TIMEOUT, 25),
         )
     except httpx.HTTPError as exc:
         raise ProviderError(f"{NETWORK_ERROR}: {type(exc).__name__}: {exc}") from exc
@@ -123,7 +123,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
 
 async def fetch(client: httpx.AsyncClient, key: str, url: str) -> FetchResult:
     payload = await _call(client, key, "fetch_page_content", {
-        "urls": [url], "max_chars": FETCH_MAX_CHARS, "live": True,
+        "urls": [url], "max_chars": get_settings().FETCH_MAX_CHARS, "live": True,
     })
     text = payload["text"]
     structured = payload.get("structured") or {}

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import httpx
 
-from .base import SearchResult, business_error, post_json, strict_items, text_of
+from .base import SearchResult, business_error, date_metadata, post_json, strict_items, text_of
 
 SEARCH_URL = "https://qianfan.baidubce.com/v2/ai_search/web_search"
 
@@ -39,7 +39,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
             title=text_of(item.get("title")),
             snippet=text_of(item.get("content")),
             rank=len(results),
-            published=text_of(item.get("date")),
+            dates=date_metadata(source_date=item.get("date")),
         ))
         if len(results) >= max_results:
             break

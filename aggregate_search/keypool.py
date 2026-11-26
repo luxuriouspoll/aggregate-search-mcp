@@ -5,8 +5,8 @@
 - 同一家可以配多个 key，按顺序轮询；一次搜索内同一个 key 不重复尝试
 - 并发请求优先分到空闲的 key；key 不够分时共用，而不是让后来的请求直接失败
 - key 失败时按错误类型打标记并带冷却截止时间（reset_at），冷却期内跳过
-- 冷却到期自动恢复；成功后清掉该 key 的失败标记
-- 到达本地用量上限（DAILY_LIMITS / MONTHLY_LIMITS）的 key 同样跳过
+- 冷却到期自动恢复；先前已发出的成功响应不清除其他请求设下的冷却
+- 到达本地用量上限（DAILY_LIMITS / MONTHLY_LIMITS）的 key 同样跳过，发送前原子预占
 - 状态只落盘 key 的 sha256 摘要，不落明文 key
 
 错误分档（决定冷却多久、影响范围）：
@@ -20,13 +20,12 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
 import time
 from dataclasses import dataclass, field
 
-from . import usage
-from . import store
-from .config import QUOTA_COOLDOWN, RATE_COOLDOWN
+from . import config, store, usage
 
 INVALID_COOLDOWN = 24 * 3600
 
@@ -88,13 +87,15 @@ def classify(status: int, message: str) -> str | None:
 
 
 @dataclass
-class KeyState:
-    code: str = ""          # invalid / quota / rate
-    message: str = ""
-    reset_at: float = 0.0   # epoch 秒；<= now 视为已恢复
-
-    def active(self, now: float | None = None) -> bool:
-        return self.reset_at > (now if now is not None else time.time())
+class _PoolStatus:
+    total: int
+    cooling: int = 0
+    capped: int = 0
+    usable: int = 0
+    reset: float | None = None
+    reason: str = ""
+    unreliable: int = 0
+    note: str = ""
 
 
 @dataclass
@@ -120,40 +121,33 @@ class KeyPool:
         同一次请求内重试不会重复选同一个 key。
         并发时优先挑没人在用的 key；都在用就共用负载最轻的那个——
         只配了一个 key 的厂商也得能同时服务多个请求。
-        取到 key 即记一次用量（按发出的请求数计）。
+        取到 key 前先完成预占；出错或取消不退还，避免少记上游可能已收到的调用。
         """
         attempted = attempted or set()
-        now = time.time()
         with _LOCK:
-            states = _load_state()
-            bucket = states.get(self.provider, {})
-            total = len(self.keys)
+            keys = self.keys
+            total = len(keys)
             if not total:
                 return None
             start = self._cursor % total
-            best: tuple[int, int, int] | None = None  # (并发占用数, 轮转偏移, 下标)
+            candidates = []
             for offset in range(total):
                 index = (start + offset) % total
-                fp = _fingerprint(self.keys[index])
-                if fp in attempted:
-                    continue
-                state = bucket.get(fp)
-                if state and state.active(now):
-                    continue
-                if usage.limit_reached(self.provider, fp):
-                    continue
-                candidate = (_IN_FLIGHT.get(fp, 0), offset, index)
-                if best is None or candidate < best:
-                    best = candidate
-            if best is None:
+                fp = _fingerprint(keys[index])
+                if fp not in attempted:
+                    candidates.append((_IN_FLIGHT.get(fp, 0), offset, index, fp))
+            # 保持「占用数优先、同占用轮转」；失败候选在同一事务里跳过。
+            candidates.sort()
+            chosen = store.reserve_key(
+                self.provider, [candidate[3] for candidate in candidates],
+                lambda: usage.limits_for(self.provider, reservation=True),
+            )
+            if chosen is None:
                 return None
-            index = best[2]
-            key = self.keys[index]
-            fp = _fingerprint(key)
+            index = next(index for _, _, index, fp in candidates if chosen == fp)
             self._cursor = (index + 1) % total
-            _IN_FLIGHT[fp] = _IN_FLIGHT.get(fp, 0) + 1
-            usage.count_call(self.provider, fp)
-            return key
+            _IN_FLIGHT[chosen] = _IN_FLIGHT.get(chosen, 0) + 1
+            return keys[index]
 
     def release(self, key: str) -> None:
         """请求结束后释放 in-flight 占用；冷却状态由 record_failure 另行记录。"""
@@ -172,54 +166,60 @@ class KeyPool:
         except ValueError:
             return 0
 
+    def _status(self, *, show_usage: bool = False) -> _PoolStatus:
+        keys = self.keys
+        status = _PoolStatus(total=len(keys))
+        if not keys:
+            return status
+        limits = usage.limits_for(self.provider)
+        state = store.read_provider_state(self.provider, counters=show_usage or any(limits))
+        today = month = 0
+        for key in keys:
+            fp = _fingerprint(key)
+            reset = state.cooldowns.get(fp)
+            if reset is not None:
+                status.cooling += 1
+                status.reset = reset if status.reset is None else min(status.reset, reset)
+            counts = state.used(fp)
+            reason = usage.limit_reason(counts, limits)
+            if reason == usage.ACCOUNTING_UNAVAILABLE:
+                status.unreliable += 1
+            elif reason:
+                status.capped += 1
+                if not status.reason:
+                    status.reason = reason
+            elif reset is None:
+                status.usable += 1
+            today += counts[0] or 0
+            month += counts[1] or 0
+        daily, monthly = limits
+        if show_usage and (today or month or daily or monthly) and not status.unreliable:
+            parts = [f"今日已用 {today}" + (f"/{daily * status.total}" if daily else "")]
+            if monthly:
+                parts.append(f"本月已用 {month}/{monthly * status.total}")
+            status.note = "；" + "，".join(parts)
+        return status
+
     def available(self) -> int:
         """当前未冷却的 key 数量（不看用量上限）。"""
-        now = time.time()
-        states = _load_state().get(self.provider, {})
-        return sum(
-            1
-            for key in self.keys
-            if not (states.get(_fingerprint(key)) or KeyState()).active(now)
-        )
+        status = self._status()
+        return status.total - status.cooling
 
     def usable(self) -> int:
-        """现在真能拿来发请求的 key 数量：未冷却，且没到本地用量上限。"""
-        now = time.time()
-        states = _load_state().get(self.provider, {})
-        count = 0
-        for key in self.keys:
-            fp = _fingerprint(key)
-            if (states.get(fp) or KeyState()).active(now):
-                continue
-            if usage.limit_reached(self.provider, fp):
-                continue
-            count += 1
-        return count
+        """当前可用的 key 数量。实际发请求前以事务内预占结果为准。"""
+        return self._status().usable
 
     def capped(self) -> int:
         """已到本地用量上限的 key 数量。"""
-        return sum(
-            1 for key in self.keys if usage.limit_reached(self.provider, _fingerprint(key))
-        )
+        return self._status().capped
 
     def capped_reason(self) -> str:
         """到的是日上限还是月上限，如「今日已用 90/90」；没到量返回空串。"""
-        for key in self.keys:
-            reason = usage.limit_reached(self.provider, _fingerprint(key))
-            if reason:
-                return reason
-        return ""
+        return self._status().reason
 
     def earliest_reset(self) -> float | None:
-        """所有 key 都被冷却时，最早恢复的时间点。"""
-        states = _load_state().get(self.provider, {})
-        resets = [
-            states[_fingerprint(key)].reset_at
-            for key in self.keys
-            if _fingerprint(key) in states
-            and states[_fingerprint(key)].reset_at > time.time()
-        ]
-        return min(resets) if resets else None
+        """有冷却的 key 中最早恢复的时间点。"""
+        return self._status().reset
 
     # ---- 状态记录 ----
 
@@ -234,129 +234,41 @@ class KeyPool:
         code = classify(status, message)
         if code is None:
             return
+        settings = config.get_settings()
         if code == "invalid":
             # 状态码是猜的就别下重手：猜错了也只是歇一会儿，而不是把好 key 封一天
-            cooldown = min(INVALID_COOLDOWN, QUOTA_COOLDOWN) if soft else INVALID_COOLDOWN
-        elif code == "quota":
-            cooldown = retry_after if retry_after is not None else QUOTA_COOLDOWN
+            cooldown = min(INVALID_COOLDOWN, settings.QUOTA_COOLDOWN) if soft else INVALID_COOLDOWN
         else:
-            cooldown = retry_after if retry_after is not None else RATE_COOLDOWN
-        fp = _fingerprint(key)
-        with _LOCK:
-            states = _load_state()
-            states.setdefault(self.provider, {})[fp] = KeyState(
-                code=code,
-                message=(message or "")[:200],
-                reset_at=time.time() + cooldown,
-            )
-            _save_state(states)
+            default = settings.QUOTA_COOLDOWN if code == "quota" else settings.RATE_COOLDOWN
+            cooldown = retry_after if retry_after is not None and math.isfinite(retry_after) else default
+        message = message or ""
+        if key:
+            message = message.replace(key, "***")
+        store.upsert_key_state(self.provider, _fingerprint(key), code, message, time.time() + cooldown)
 
     def record_success(self, key: str) -> None:
-        fp = _fingerprint(key)
-        with _LOCK:
-            states = _load_state()
-            bucket = states.get(self.provider)
-            if bucket and bucket.pop(fp, None) is not None:
-                if not bucket:
-                    states.pop(self.provider, None)
-                _save_state(states)
+        """保持调用接口；预占时没有冷却，后来出现的标记不能被旧成功清掉。"""
 
     def status_line(self) -> str:
         """给结果尾部用的状态摘要，如 '2/3 可用（1 个冷却中）；今日已用 12/90'。"""
-        total = len(self.keys)
-        if not total:
+        status = self._status(show_usage=True)
+        if not status.total:
             return "无需 key"
-        ok = self.usable()
-        if ok == total:
-            line = f"{ok}/{total} 可用"
-        else:
-            cooling = total - self.available()
-            capped = self.capped()
-            notes = []
-            if cooling:
-                reset = self.earliest_reset()
-                when = ""
-                if reset:
-                    left = max(0, int(reset - time.time()))
-                    when = f"，最早 {left // 60} 分钟后恢复" if left >= 60 else f"，最早 {left} 秒后恢复"
-                notes.append(f"{cooling} 个冷却中{when}")
-            if capped:
-                notes.append(f"{capped} 个已到本地用量上限")
-            line = f"{ok}/{total} 可用（{'；'.join(notes)}）"
-        return line + self._usage_note()
+        line = f"{status.usable}/{status.total} 可用"
+        notes = []
+        if status.cooling:
+            left = max(0, int(status.reset - time.time())) if status.reset is not None else 0
+            when = f"，最早 {left // 60} 分钟后恢复" if left >= 60 else f"，最早 {left} 秒后恢复"
+            notes.append(f"{status.cooling} 个冷却中{when}")
+        if status.capped:
+            notes.append(f"{status.capped} 个已到本地用量上限")
+        if status.unreliable:
+            notes.append(f"{status.unreliable} 个{usage.ACCOUNTING_UNAVAILABLE}")
+        if notes:
+            line += f"（{'；'.join(notes)}）"
+        return line + status.note
 
-    def _usage_note(self) -> str:
-        daily, monthly = usage.limits_for(self.provider)
-        today = month = 0
-        for key in self.keys:
-            used_today, used_month = usage.used(self.provider, _fingerprint(key))
-            today += used_today
-            month += used_month
-        if not (today or month or daily or monthly):
-            return ""
-        count = len(self.keys)
-        parts = [f"今日已用 {today}" + (f"/{daily * count}" if daily else "")]
-        if monthly:
-            parts.append(f"本月已用 {month}/{monthly * count}")
-        return "；" + "，".join(parts)
-
-
-# ---- 状态读写 ----
 
 _LOCK = threading.RLock()
 # key 指纹 -> 正在使用它的请求数。只用来把并发请求分散到不同 key，不是互斥锁。
 _IN_FLIGHT: dict[str, int] = {}
-_CACHE: dict[str, dict[str, KeyState]] | None = None
-_CACHE_MTIME: float = -1.0
-
-
-def _file_mtime() -> float:
-    try:
-        return store.DB_FILE.stat().st_mtime
-    except OSError:
-        return -1.0
-
-
-def _load_state() -> dict[str, dict[str, KeyState]]:
-    """读取冷却状态（SQLite）。带一层内存缓存，避免每次取 key 都查库。"""
-    global _CACHE, _CACHE_MTIME
-    with _LOCK:
-        mtime = _file_mtime()
-        if _CACHE is not None and mtime == _CACHE_MTIME:
-            return _CACHE
-        data: dict[str, dict[str, KeyState]] = {}
-        for provider, bucket in store.load_key_state().items():
-            fresh = {}
-            for fp, item in bucket.items():
-                try:
-                    reset_at = float(item.get("reset_at", 0) or 0)
-                except (TypeError, ValueError):
-                    continue
-                if reset_at > time.time():
-                    fresh[str(fp)] = KeyState(
-                        code=str(item.get("code", "")),
-                        message=str(item.get("message", "")),
-                        reset_at=reset_at,
-                    )
-            if fresh:
-                data[provider] = fresh
-        _CACHE = data
-        _CACHE_MTIME = mtime
-        return data
-
-
-def _save_state(states: dict[str, dict[str, KeyState]]) -> None:
-    """写入冷却状态（SQLite 事务，多进程并发安全）。"""
-    global _CACHE, _CACHE_MTIME
-    _CACHE = states
-    payload = {
-        provider: {
-            fp: {"code": st.code, "message": st.message, "reset_at": st.reset_at}
-            for fp, st in bucket.items()
-        }
-        for provider, bucket in states.items()
-        if bucket
-    }
-    store.save_key_state(payload)
-    _CACHE_MTIME = _file_mtime()
-

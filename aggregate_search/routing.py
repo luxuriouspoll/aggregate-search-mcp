@@ -10,23 +10,12 @@
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
-from .config import (
-    ADAPTIVE_BAD_RATE,
-    ADAPTIVE_GOOD_RATE,
-    ADAPTIVE_MIN_CALLS,
-    ADAPTIVE_ROUTING,
-    CASE_SENSITIVE_QUERY_TERMS,
-    DOMESTIC_PROVIDERS,
-    DOMESTIC_QUERY_TERMS,
-    GLOBAL_PROVIDERS,
-    GLOBAL_QUERY_TERMS,
-    PAID_PROVIDERS,
-    REGION_ROUTING,
-    UNVERIFIED_PROVIDERS,
-)
+from . import config
+
 
 def _load_stats() -> dict[str, dict]:
     """读近 7 天的厂商表现。读失败就当没有数据（路由退回静态顺序，不影响可用性）。"""
@@ -80,7 +69,7 @@ def _matches(term: str, query: str) -> bool:
     if any("\u4e00" <= ch <= "\u9fff" for ch in term):
         return term.casefold() in query.casefold()
     pattern = rf"(?<![a-zA-Z0-9_]){re.escape(term)}(?![a-zA-Z0-9_])"
-    if term.casefold() in CASE_SENSITIVE_QUERY_TERMS:
+    if term.casefold() in config.CASE_SENSITIVE_QUERY_TERMS:
         return re.search(pattern + _TECH_SUFFIX, query) is not None
     return re.search(pattern, query, re.I) is not None
 
@@ -90,21 +79,23 @@ def detect_region(query: str, override: str = "auto") -> RegionDecision:
         return RegionDecision(
             override, (), f"调用方指定 region={override}，按{REGION_LABELS[override]}顺序补源"
         )
-    if REGION_ROUTING in ("cn", "domestic"):
+    settings = config.get_settings()
+    if settings.REGION_ROUTING in ("cn", "domestic"):
         return RegionDecision("domestic", (), "REGION_ROUTING 固定为国内补源")
-    if REGION_ROUTING in ("global", "international"):
+    if settings.REGION_ROUTING in ("global", "international"):
         return RegionDecision("global", (), "REGION_ROUTING 固定为国际补源")
-    if REGION_ROUTING in ("off", "false", "0", "none"):
+    if settings.REGION_ROUTING in ("off", "false", "0", "none"):
         return RegionDecision("auto", (), "地区路由已关闭，使用通用补源顺序")
 
     # 词边界适用于英文；中文实体直接包含匹配。长词优先，避免“美国”被泛词覆盖。
+    lowered = query.casefold()
     domestic = sorted(
-        (term for term in DOMESTIC_QUERY_TERMS if term and term.casefold() in query.casefold()),
+        (term for term in settings.DOMESTIC_QUERY_TERMS if term and term.casefold() in lowered),
         key=len,
         reverse=True,
     )
     global_terms = sorted(
-        (term for term in GLOBAL_QUERY_TERMS if term and _matches(term, query)),
+        (term for term in settings.GLOBAL_QUERY_TERMS if term and _matches(term, query)),
         key=len,
         reverse=True,
     )
@@ -121,47 +112,66 @@ def detect_region(query: str, override: str = "auto") -> RegionDecision:
     return RegionDecision("auto", (), "无明确地域实体，使用通用补源顺序")
 
 
-def _verified_first(names: list[str]) -> list[str]:
-    """已实测的厂商排在前面，未实测的排后面（保持各自的相对顺序）。
+def _verified_first(names: list[str], unverified: frozenset[str]) -> list[str]:
+    """已实测的厂商排在前面，未实测的排后面，各自保持静态顺序。"""
+    return sorted(names, key=unverified.__contains__)
 
-    未实测的厂商并不是不能用——只是作者没真实调用过，稳定性未知，
-    所以放在后面：国内/国际的优先顺序不变，只是同一组内先给验证过的机会。
-    """
-    verified = [name for name in names if name not in UNVERIFIED_PROVIDERS]
-    unverified = [name for name in names if name in UNVERIFIED_PROVIDERS]
-    return verified + unverified
+
+@dataclass(frozen=True)
+class _Performance:
+    tier: int
+    hit_rate: float
+    avg_ms: float | None
+
+
+def _performance(row: dict, settings: config.RuntimeSettings) -> _Performance | None:
+    # 真实空结果既不是命中也不是失败；全空或证据不足的厂商不参与调序。
+    if row.get("calls", 0) - row.get("empty", 0) < settings.ADAPTIVE_MIN_CALLS:
+        return None
+    hit_rate = row.get("hit_rate", row.get("ok_rate"))
+    if not isinstance(hit_rate, (int, float)) or not 0 <= hit_rate <= 1:
+        return None
+    tier = (2 if hit_rate < settings.ADAPTIVE_BAD_RATE else
+            0 if hit_rate >= settings.ADAPTIVE_GOOD_RATE else 1)
+    avg_ms = row.get("avg_ms")
+    if (row.get("latency_samples", 0) < settings.ADAPTIVE_MIN_CALLS
+            or not isinstance(avg_ms, (int, float)) or not math.isfinite(avg_ms) or avg_ms < 0):
+        avg_ms = None
+    return _Performance(tier, hit_rate, avg_ms)
+
+
+def _prefer(right: _Performance, left: _Performance) -> bool:
+    if right.tier != left.tier:
+        return right.tier < left.tier
+    # 同可靠性档内先尊重明显的命中率差距；只有接近时才拿延迟做次级信号。
+    if abs(right.hit_rate - left.hit_rate) >= 0.05:
+        return right.hit_rate > left.hit_rate
+    if right.avg_ms is None or left.avg_ms is None:
+        return False
+    return left.avg_ms - right.avg_ms >= max(100.0, 0.2 * left.avg_ms)
 
 
 def _adaptive_order(names: list[str], stats: dict[str, dict]) -> list[str]:
-    """在**同一组内部**按近 7 天表现做轻微调权，返回组内重排后的顺序。
+    """同地域、同验证档内只做一轮相邻换位；小/未知样本保持原位。"""
+    settings = config.get_settings()
+    domestic, international = set(settings.DOMESTIC_PROVIDERS), set(settings.GLOBAL_PROVIDERS)
+    unverified = settings.UNVERIFIED_PROVIDERS
 
-    防死锁的几条硬约束：
-    - 只有累计真实调用 >= ADAPTIVE_MIN_CALLS 的厂商才参与调权；
-    - 每次最多把一家往后挪一位，绝不把任何厂商剔出名单；
-    - 成功率低的只是排到同组末尾（下次仍会被尝试），成功率高且调用多的略提前；
-    - 完全没有统计数据的厂商保持原位，不因为「没见过」就被压到后面。
-    """
-    if not names:
-        return names
-    qualified = {
-        name: row for name, row in stats.items()
-        if row.get("calls", 0) >= ADAPTIVE_MIN_CALLS and name in names
-    }
-    if not qualified:
-        return names
+    def group(name: str) -> tuple[bool, bool, bool]:
+        return name in domestic, name in international, name in unverified
 
-    def tier(name: str) -> int:
-        row = qualified.get(name)
-        if row is None:
-            return 1                                    # 没数据：保持中间，不被惩罚
-        if row["ok_rate"] < ADAPTIVE_BAD_RATE:
-            return 2                                    # 表现差：同组末尾
-        if row["ok_rate"] >= ADAPTIVE_GOOD_RATE:
-            return 0                                    # 表现好：同组靠前
-        return 1
-
-    # 稳定排序：只按档次分，档次内保持原相对顺序，最多相当于挪一位
-    return sorted(names, key=tier)
+    ordered = list(names)
+    perf = {name: _performance(stats.get(name, {}), settings) for name in ordered}
+    i = 0
+    while i + 1 < len(ordered):
+        left, right = ordered[i:i + 2]
+        a, b = perf[left], perf[right]
+        if a is not None and b is not None and group(left) == group(right) and _prefer(b, a):
+            ordered[i], ordered[i + 1] = right, left
+            i += 2  # 已换位的两家都不能再挪
+        else:
+            i += 1
+    return ordered
 
 
 def order_escalation(query: str, region: str = "auto") -> tuple[list[str], RegionDecision]:
@@ -171,15 +181,17 @@ def order_escalation(query: str, region: str = "auto") -> tuple[list[str], Regio
     有没有在冷却或到量，由调用方过滤之后再取前几家，这样才能凑满数量。
     """
     decision = detect_region(query, region)
+    settings = config.get_settings()
+    unverified = settings.UNVERIFIED_PROVIDERS
     # 组内先给实测过的厂商机会，未实测的往后排（不跨组，不打乱国内/国际优先级）
-    domestic = _verified_first(list(DOMESTIC_PROVIDERS))
-    international = _verified_first(list(GLOBAL_PROVIDERS))
-    generic = _verified_first(list(PAID_PROVIDERS))
-    if ADAPTIVE_ROUTING:
-        # 自适应调权只在各自组内做，绝不跨区
-        stats = _load_stats()
+    domestic = _verified_first(list(settings.DOMESTIC_PROVIDERS), unverified)
+    international = _verified_first(list(settings.GLOBAL_PROVIDERS), unverified)
+    generic = _verified_first(list(settings.PAID_PROVIDERS), unverified)
+    stats = _load_stats() if settings.ADAPTIVE_ROUTING else {}
+    if stats and decision.region != "auto":
         domestic = _adaptive_order(domestic, stats)
         international = _adaptive_order(international, stats)
+    elif stats:
         generic = _adaptive_order(generic, stats)
 
     if decision.region == "domestic":

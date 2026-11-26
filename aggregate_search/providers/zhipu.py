@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import httpx
 
-from .base import SearchResult, business_error, error_text, post_json, strict_items, text_of
+from .base import SearchResult, business_error, date_metadata, error_text, post_json, strict_items, text_of
 
 SEARCH_URL = "https://open.bigmodel.cn/api/paas/v4/web_search"
 
@@ -33,7 +33,8 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
             title=text_of(item.get("title")),
             snippet=text_of(item.get("content")),
             rank=len(results),
-            published=text_of(item.get("publish_date") or item.get("date")),
+            published=text_of(item.get("publish_date")),
+            dates=date_metadata(source_date=item.get("date")),
         ))
         if len(results) >= max_results:
             break

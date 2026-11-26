@@ -11,7 +11,9 @@ import asyncio
 import os
 import sys
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import quote
 
 # 沙盒里的假 key。特意给 parallel 也配一个，用来证明匿名阶段不会带上它；
@@ -32,6 +34,7 @@ SANDBOX_ENV: dict[str, str] = {
     "PARALLEL_API_KEY": _fake_key("parallel"),
     "PERPLEXITY_API_KEY": _fake_key("perplexity"),
     "DAILY_LIMITS": "jina:2",
+    "USE_SYSTEM_PROXY": "false",
 }
 
 ANON_THREE = {"parallel", "keenable", "anysearch"}
@@ -119,37 +122,107 @@ def _install_fakes() -> None:
     from . import providers
 
     REAL.update(providers.REGISTRY)
-    for name, (search_fn, fetch_fn) in list(providers.REGISTRY.items()):
+    _restore_fakes()
+
+
+def _restore_fakes() -> None:
+    from . import providers
+
+    for name, (search_fn, fetch_fn) in REAL.items():
         providers.REGISTRY[name] = (
             _fake_search(name) if search_fn else None,
             _fake_fetch(name) if fetch_fn else None,
         )
 
 
+@contextmanager
+def _offline_http():
+    """让遗漏的 HTTP mock 明确失败，不让真实传输试图联网。"""
+    import httpx
+
+    unexpected = []
+
+    def denied(transport, request):
+        unexpected.append(request.url.host)
+        raise AssertionError("离线自测必须为 HTTP 请求提供 MockTransport")
+
+    async def denied_async(transport, request):
+        denied(transport, request)
+
+    try:
+        with (patch.object(httpx.HTTPTransport, "handle_request", denied),
+              patch.object(httpx.AsyncHTTPTransport, "handle_async_request", denied_async)):
+            yield
+    finally:
+        # provider 会隔离并吞掉网络层错误；这里再次断言，确保遗漏 mock 不会造成假通过。
+        assert not unexpected, f"离线自测遇到未模拟的 HTTP 主机: {unexpected}"
+
+
+def _reset_store() -> None:
+    """只清理沙盒中的 SQLite 文件和旧版迁移夹具。"""
+    from . import config, store
+
+    assert config.CONFIG_DIR == Path(os.environ["AGGREGATE_SEARCH_HOME"]).resolve()
+    store.reset_connection()
+    for path in (
+        store.DB_FILE, store.DB_FILE.with_name(store.DB_FILE.name + "-wal"),
+        store.DB_FILE.with_name(store.DB_FILE.name + "-shm"), store.LEGACY_KEY_STATE,
+        store.LEGACY_COUNTERS, config.USAGE_LOG_FILE,
+    ):
+        assert path.resolve().parent == config.CONFIG_DIR, path
+        path.unlink(missing_ok=True)
+    for path in (store.LEGACY_KEY_STATE, store.LEGACY_COUNTERS):
+        path.with_name(path.name + ".migrated").unlink(missing_ok=True)
+
+
 def _reset() -> None:
     """每个用例开始前清场：假后端、搜索缓存、冷却状态、用量计数、使用记录。"""
-    from . import config, keypool, providers, server, usage
+    from . import config, keypool, providers, server
 
     FAKES.reset()
+    _restore_fakes()
     server._RECENT.clear()
     server._SERIAL.clear()
-    server._fetch_cache_clear()   # 抓取缓存也清掉，否则同一网址的用例会互相串味
-    for path in (config.KEY_STATE_FILE, config.USAGE_COUNTER_FILE, config.USAGE_LOG_FILE):
-        path.unlink(missing_ok=True)
-    # 状态现在存在 SQLite 里：删库文件并重建连接，否则上一个用例的冷却/计数会带过来
-    from . import store
-    store.reset_connection()
-    for suffix in ("", "-wal", "-shm"):
-        (store.DB_FILE.parent / (store.DB_FILE.name + suffix)).unlink(missing_ok=True)
-    store.reset_connection()
-    keypool._CACHE = None
-    keypool._CACHE_MTIME = -1.0
+    server._fetch_cache_clear()
+    _reset_store()
     keypool._IN_FLIGHT.clear()
     providers._ANON_COOLDOWN.clear()
-    usage._CACHE = None
-    usage._CACHE_MTIME = -1.0
-    for pool in providers.POOLS.values():
+    for pool in providers.get_pools().values():
         pool._cursor = 0
+
+
+def _sandbox_env(home: Path, **settings: str) -> dict[str, str]:
+    """给回归子进程一个新配置目录，绝不带入主机或上一级沙盒的账号设置。"""
+    from .cli import _PASSTHROUGH_ENV
+
+    env = {name: os.environ[name] for name in _PASSTHROUGH_ENV if name in os.environ and name != "PYTHONPATH"}
+    return {**env, "AGGREGATE_SEARCH_HOME": str(home), "USE_SYSTEM_PROXY": "false", **settings}
+
+
+def _child_command(target, *args: str) -> list[str]:
+    package_parent = Path(__file__).resolve().parent.parent
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "sys.stdout.reconfigure(encoding='utf-8'); sys.stderr.reconfigure(encoding='utf-8'); "
+        f"from aggregate_search.selftest import {target.__name__}, _offline_http\n"
+        f"with _offline_http(): {target.__name__}(*sys.argv[2:])\n"
+    )
+    return [sys.executable, "-I", "-u", "-c", code, str(package_parent), *args]
+
+
+def _run_sandbox_child(home: Path, target, **settings: str) -> None:
+    import subprocess
+
+    process = subprocess.run(_child_command(target), cwd=home, env=_sandbox_env(home, **settings),
+                             capture_output=True, encoding="utf-8", timeout=30)
+    assert process.returncode == 0, process.stdout + process.stderr
+
+
+def _write_env(path: Path, values: dict[str, str]) -> None:
+    """在临时目录原子地替换配置，不依赖休眠或文件系统的 mtime 精度。"""
+    draft = path.with_suffix(".new")
+    draft.write_text("".join(f"{name}={value}\n" for name, value in values.items()), encoding="utf-8")
+    draft.replace(path)
 
 
 def _keyed() -> list[str]:
@@ -204,7 +277,7 @@ async def t_free_explicit():
         "MCP 协议是什么", providers=["parallel", "tavily"], search_mode="free"
     )
     assert FAKES.calls == [("parallel", "")], FAKES.calls
-    assert "tavily: 未调用（free 模式只做匿名调用" in text, text
+    assert "tavily: 未调用（只做匿名调用" in text, text
     assert "没有发送任何账号 key" in text, text
 
 
@@ -264,6 +337,87 @@ async def t_all_mode():
     assert called["keenable"] == "" and called["anysearch"] == "", called
 
 
+@case("SEARCH_NO_ACCOUNT_KEYS：显式模式、抓取、底层调度和 CLI check 都不发送账号 key")
+def t_hard_no_account_keys():
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="anonymous-only-", dir=os.environ["AGGREGATE_SEARCH_HOME"]) as directory:
+        home = Path(directory)
+        _write_env(home / ".env", {
+            "SEARCH_NO_ACCOUNT_KEYS": "true", "SEARCH_MODE": "all", "WEB_FETCH_PROVIDER": "exa",
+            "PARALLEL_API_KEY": _fake_key("parallel"), "EXA_API_KEY": _fake_key("exa"),
+            "TAVILY_API_KEY": _fake_key("tavily"),
+        })
+        _run_sandbox_child(home, _child_hard_no_account_keys)
+
+
+def _child_hard_no_account_keys() -> None:
+    import io
+    from contextlib import redirect_stdout
+
+    from . import cli, config, providers, server, usage
+    from .keypool import _fingerprint
+    from .providers.base import ProviderError
+
+    _install_fakes()
+
+    async def verify():
+        assert config.force_anonymous() and config.get_settings().SEARCH_MODE == "all"
+        assert all(providers.has_keys(name) for name in ("parallel", "exa", "tavily"))
+        for mode, selected, names in (
+            ("all", None, ANON_THREE),
+            ("all", ["parallel", "tavily"], {"parallel"}),
+            ("escalate", None, ANON_THREE),
+        ):
+            FAKES.calls.clear()
+            result = await server.web_search(f"匿名策略检查 {mode} {selected is not None}", search_mode=mode, providers=selected)
+            assert {name for name, _ in FAKES.calls} == names and not _keyed(), (mode, FAKES.calls, result)
+            assert "SEARCH_NO_ACCOUNT_KEYS" in result and "没有发送任何账号 key" in result, result
+
+        FAKES.calls.clear()
+        with config.use_settings(SEARCH_PROVIDERS_LIMIT=("keenable",)):
+            await server.web_search("仅允许指定的匿名厂商", search_mode="all")
+        assert FAKES.calls == [("keenable", "")], FAKES.calls
+
+        FAKES.calls.clear()
+        FAKES.anon_errors["parallel"] = ProviderError("free-tier rate limit", status=429, retry_after=0)
+        _, errors, records = await providers.run_search(
+            ["parallel", "tavily"], "底层搜索", 3, key_fallback=("parallel",),
+        )
+        assert FAKES.calls == [("parallel", "")] and set(errors) == {"parallel", "tavily"}, FAKES.calls
+        assert records[0].sent and not records[1].sent and not any(r.used_key for r in records), records
+        FAKES.anon_errors.clear()
+
+        target = "https://docs.example/anonymous"
+        denied = await server.web_fetch(target, "exa")
+        assert "只做匿名调用" in denied and not FAKES.fetch_calls, denied
+        await server.web_fetch(target)
+        await server.web_fetch(target, "parallel")
+        assert (await providers.run_fetch("parallel", target, anonymous=False)).auth == "anon"
+        try:
+            await providers.run_fetch("exa", target, anonymous=False)
+        except ProviderError as exc:
+            assert exc.sent is False, exc
+        else:
+            raise AssertionError("底层抓取向仅支持账号的后端发出了请求")
+        assert FAKES.fetch_calls == [("parallel", "")] * 3, FAKES.fetch_calls
+        for name in ("parallel", "exa", "tavily"):
+            assert usage.used(name, _fingerprint(_fake_key(name))) == (0, 0), name
+
+    asyncio.run(_run_case(verify()))
+    FAKES.calls.clear()
+    captured = io.StringIO()
+    with redirect_stdout(captured):
+        try:
+            cli.main(["check", "匿名检查"])
+        except SystemExit as exc:
+            assert exc.code == 0, captured.getvalue()
+        else:
+            raise AssertionError("CLI check 没有返回退出码")
+    assert {name for name, _ in FAKES.calls} == ANON_THREE and not _keyed(), FAKES.calls
+    assert "仅检查匿名通道" in captured.getvalue() and "[OK]" in captured.getvalue(), captured.getvalue()
+
+
 # ---------------- 并发与多 key ----------------
 
 @case("并发：只配了一个 key 的厂商也能同时服务多个请求")
@@ -288,7 +442,7 @@ async def t_concurrency():
 
 @case("key 池：轮转、冷却、已试过的不重试、单 key 可共用")
 def t_keypool():
-    from . import keypool
+    from . import keypool, store
     from .keypool import classify
 
     assert classify(401, "") == "invalid"
@@ -317,10 +471,12 @@ def t_keypool():
     retried = pool.next_key({keypool._fingerprint(first)})
     assert retried == "key-two-yyyy", retried
     pool.release(retried)
-    # 成功清除标记
+    # 一个在途请求成功，不能抹掉别的请求刚写入的冷却；显式删除才清除。
     pool.record_failure("key-two-yyyy", 402, "quota")
     assert pool.available() == 1, pool.available()
     pool.record_success("key-two-yyyy")
+    assert pool.available() == 1, pool.available()
+    store.delete_key_state("demo", keypool._fingerprint("key-two-yyyy"))
     assert pool.available() == 2, pool.available()
     # Retry-After: 0 表示立即可重试，不该被当成缺省而冷却一小时
     pool.record_failure("key-two-yyyy", 429, "rate limit", retry_after=0)
@@ -344,13 +500,13 @@ async def t_key_rotation():
     from . import config, providers
     from .providers.base import ProviderError
 
-    first, second = config.API_KEYS["tavily"]
+    first, second = config.get_settings().API_KEYS["tavily"]
     FAKES.key_errors[first] = ProviderError("HTTP 402: quota exhausted", status=402)
     _, _, records = await providers.run_search(["tavily"], "问题", 3)
     record = records[0]
     assert record.ok and record.auth == "key", record
     assert record.key_index == 2 and record.keys_tried == 2, record
-    assert providers.POOLS["tavily"].usable() == 1
+    assert providers.key_pool("tavily").usable() == 1
     # 下一次直接用第二个 key，不再碰冷却中的那个
     FAKES.calls.clear()
     await providers.run_search(["tavily"], "问题", 3)
@@ -390,7 +546,7 @@ async def t_backfill():
     FAKES.errors["volcengine"] = ProviderError("HTTP 500: upstream boom", status=500)
     text = await server.web_search("MCP 协议是什么")
     assert _keyed() == ["volcengine", "querit", "tavily", "exa"], FAKES.calls
-    assert "volcengine（key）: 失败（HTTP 500" in text, text
+    assert "volcengine（key）: 失败" in text and ">HTTP 500: upstream boom</untrusted_content>" in text, text
     assert "有效返回 **3 家**" in text and "失败 **1 家**" in text, text
 
 
@@ -485,8 +641,8 @@ def t_region_detect():
 async def t_limits():
     from . import config, providers, server
 
-    assert config.DAILY_LIMITS.get("jina") == 2
-    assert config.DAILY_LIMITS.get("baidu") == 90      # 内置默认：防止百度超出免费额度后计费
+    assert config.get_settings().DAILY_LIMITS.get("jina") == 2
+    assert config.get_settings().DAILY_LIMITS.get("baidu") == 90      # 内置默认：防止百度超出免费额度后计费
     for _ in range(2):
         _, _, records = await providers.run_search(["jina"], "问题", 3)
         assert records[0].ok, records[0]
@@ -494,7 +650,7 @@ async def t_limits():
     assert not records[0].ok and "本地用量上限" in errors["jina"], errors
     assert len([c for c in FAKES.calls if c[0] == "jina"]) == 2, FAKES.calls   # 第三次没发出去
     assert not server._escalation_ready("jina", {}, {})
-    line = providers.POOLS["jina"].status_line()
+    line = providers.key_pool("jina").status_line()
     assert "已到本地用量上限" in line and "今日已用 2/2" in line, line
 
 
@@ -510,7 +666,7 @@ async def t_usage_log():
     log = config.USAGE_LOG_FILE
     assert log.is_file() and config.CONFIG_DIR in log.parents, log
     raw = log.read_text(encoding="utf-8")
-    for keys in config.API_KEYS.values():
+    for keys in config.get_settings().API_KEYS.values():
         for key in keys:
             assert key not in raw, "使用记录里不应出现 key"
     events = usage.read_events(1)
@@ -570,24 +726,24 @@ async def t_fetch_fallback():
     _reset()
     await server.web_fetch("https://example.com/a", "exa")
     assert [name for name, _ in FAKES.fetch_calls] == ["exa"], FAKES.fetch_calls
-    assert "只支持 http/https" in await server.web_fetch("ftp://example.com/a")
+    assert "http/https" in await server.web_fetch("ftp://example.com/a")
+    assert [name for name, _ in FAKES.fetch_calls] == ["exa"], "无效 URL 不应派发"
 
 
 # ---------------- 工具说明与状态 ----------------
 
-@case("工具说明与实际配置一致（抓取后端、模式、补搜数量）")
+@case("工具说明公开稳定参数，动态配置以 web_status 为准")
 async def t_descriptions():
-    from . import config, providers, server
+    from . import config, server
 
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
     assert set(tools) == {"web_search", "web_fetch", "web_status"}, set(tools)
-    for name in providers.FETCH_PROVIDERS:
-        assert name in tools["web_fetch"].description, name
     search = tools["web_search"].description
     for mode in config.SEARCH_MODES:
         assert mode in search, mode
-    assert f"追加 {config.AUTO_ESCALATE_MAX} 个不同厂商" in search, search
-    assert "region" in tools["web_search"].inputSchema["properties"]
+    assert "web_status" in search and "web_status" in tools["web_fetch"].description
+    assert {"region", "search_mode", "time_range", "domains"} <= tools["web_search"].inputSchema["properties"].keys()
+    assert "provider" in tools["web_fetch"].inputSchema["properties"]
     assert "usage_days" in tools["web_status"].inputSchema["properties"]
 
 
@@ -610,10 +766,42 @@ async def t_redact():
     from . import config, server
     from .providers.base import ProviderError
 
-    key = config.API_KEYS["volcengine"][0]
+    key = config.get_settings().API_KEYS["volcengine"][0]
     FAKES.errors["volcengine"] = ProviderError(f"HTTP 400: bad token {key}", status=400)
     text = await server.web_search("MCP 协议是什么", providers=["volcengine"])
     assert key not in text and "***" in text, text
+
+
+@case("已配置的 HTTP Bearer Token 不出现在搜索/抓取报错与本地使用记录")
+def t_bearer_token_redacted():
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="bearer-", dir=os.environ["AGGREGATE_SEARCH_HOME"]) as directory:
+        home = Path(directory)
+        _write_env(home / ".env", {"MCP_HTTP_TOKEN": _fake_key("http-bearer"), "VOLCENGINE_API_KEY": _fake_key("volcengine")})
+        _run_sandbox_child(home, _child_bearer_token)
+
+
+def _child_bearer_token() -> None:
+    from . import config, server
+    from .providers.base import ProviderError, brief
+
+    async def verify():
+        token = _fake_key("http-bearer")
+        assert config.MCP_HTTP_TOKEN == token
+        note = f"配置校验回显 Authorization: Bearer {token}"
+        error = ProviderError(note, status=400)
+        # token 横跨摘要截断点时也应先脱敏，不能残留前缀。
+        assert brief("x" * 18 + token, limit=24) == "x" * 18 + "***"
+        FAKES.errors["volcengine"] = error
+        FAKES.fetch_errors["parallel"] = error
+        search = await server.web_search("配置校验笔记", providers=["volcengine"])
+        fetch = await server.web_fetch("https://docs.example/notes", "parallel")
+        for text in (search, fetch, config_log_text()):
+            assert token not in text and "Bearer ***" in text, text
+
+    _install_fakes()
+    asyncio.run(_run_case(verify()))
 
 
 @case("合并去重：URL 归一化、多摘要保留、近似转载折叠、版本号不误合并")
@@ -703,7 +891,7 @@ def t_merge():
     version_kept, version_count = fold_near_duplicates(versions)
     assert version_count == 0 and len(version_kept) == 2
 
-    # 折叠新增来源后必须重新计算 source_count、best_rank 和排序
+    # 转载仍保留来源与最佳排名，但不能冒充来自独立来源的共识。
     rerank_input = merge_results({
         "a": [SearchResult("a", "https://a.example/story", "相同文章标题用于测试排序", "这是完全相同的文章摘要内容，用于验证转载折叠后的排名和来源统计是否正确。", 8)],
         "b": [SearchResult("b", "https://b.example/repost", "相同文章标题用于测试排序", "这是完全相同的文章摘要内容，用于验证转载折叠后的排名和来源统计是否正确。", 9)],
@@ -715,25 +903,49 @@ def t_merge():
     repost = next(x for x in reranked if x["url"] == "https://a.example/story")
     assert repost["source_count"] == 2 and repost["best_rank"] == 8
     assert repost["evidence"][1]["url"] == "https://b.example/repost"
-    assert reranked[0]["source_count"] == 2
+    assert repost["consensus_source_count"] == 1
+    assert reranked[0]["url"] == "https://c.example/other" and reranked[0]["consensus_source_count"] == 1, reranked
+
+
+@case("近似去重：纯数字标题和正文里紧邻中文字的不同金额不折叠")
+def t_near_duplicates_keep_distinct_numbers():
+    from .providers.base import SearchResult, fold_near_duplicates, merge_results
+
+    description = "这份说明介绍标准服务的费用、支付方式和生效日期，以及如何查看后续的续费计费规则。"
+    title = "标准服务费用及续费细则说明"
+    for titles, snippets in (
+        (("202601010001000123456781", "202601010001000123456782"), (description, description)),
+        ((title, title), (
+            description + "方案价格人民币1099元每年，续费规则详见附录。",
+            description + "方案价格人民币1999元每年，续费规则详见附录。",
+        )),
+        ((title, title), (description + "本期预算1000万元，按附录所列明细列支。",
+                          description + "本期预算1000万美元，按附录所列明细列支。")),
+    ):
+        def compare(other_title, other_snippet):
+            return fold_near_duplicates(merge_results({
+                "one": [SearchResult("one", "https://one.example/fees", titles[0], snippets[0], 0)],
+                "two": [SearchResult("two", "https://two.example/fees", other_title, other_snippet, 0)],
+            }))
+
+        identical, identical_count = compare(titles[0], snippets[0])
+        assert identical_count == 1 and len(identical) == 1, "夹具本身需要能触发转载折叠"
+        kept, count = compare(titles[1], snippets[1])
+        assert count == 0 and len(kept) == 2, (titles, snippets, kept)
 
 
 # ---------------- 审查后补充的回归用例 ----------------
 
 @case("escalate 不能和 providers 一起用（否则只会把点名的厂商重查一遍）")
 async def t_escalate_with_providers():
-    from . import server
+    from . import config, server
 
     text = await server.web_search("MCP 协议是什么", providers=["tavily"], search_mode="escalate")
     assert "不能和 providers 一起用" in text, text
     assert FAKES.calls == [], FAKES.calls
     # 但如果 escalate 只是本机的默认值、调用方并没有明说，点名就按「查这几家」处理
-    saved = server.SEARCH_MODE
-    server.SEARCH_MODE = "escalate"
-    try:
+    with config.use_settings(SEARCH_MODE="escalate"):
         named = await server.web_search("MCP 协议是什么", providers=["keenable"])
-    finally:
-        server.SEARCH_MODE = saved
     assert [name for name, _ in FAKES.calls] == ["keenable"] and "执行模式: **auto**" in named, named
     FAKES.calls.clear()
     # 点名查询的结果里，提示会提醒下一步别再带 providers
@@ -768,17 +980,13 @@ async def t_no_backfill_when_offline():
 async def t_total_timeout():
     import time
 
-    from . import server
+    from . import config, server
 
-    saved = server.TOTAL_TIMEOUT
-    server.TOTAL_TIMEOUT = 0.3
     FAKES.delay = 2.0
-    try:
+    with config.use_settings(TOTAL_TIMEOUT=0.3):
         tick = time.monotonic()
         text = await server.web_search("MCP 协议是什么")
         elapsed = time.monotonic() - tick
-    finally:
-        server.TOTAL_TIMEOUT = saved
     assert elapsed < 1.5, elapsed
     assert not _keyed(), FAKES.calls
     assert "等待超过总时限" in text and "已到总时限 0.3 秒，没有继续递补" in text, text
@@ -817,6 +1025,48 @@ async def t_concurrent_escalate():
     assert not server._SERIAL, server._SERIAL
 
 
+@case("并发 escalate：同 query 的不同筛选并行派发、各自保存结果")
+async def t_concurrent_escalate_different_filters():
+    from datetime import datetime, timedelta, timezone
+
+    from . import config, providers, server
+    from .providers.base import SearchResult, current_filters
+
+    query = "并行检索夹具"
+    # 三个请求覆盖「仅日期不同」和「仅域名不同」，若锁退化成只看 query 就无法同时到达。
+    filters = [("day", "docs.example"), ("week", "docs.example"), ("day", "notes.example")]
+    started: set[tuple[str, str]] = set()
+    release = asyncio.Event()
+    all_started = asyncio.Event()
+    published = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+
+    async def capture(client, key, query, max_results):
+        window, domains = current_filters()
+        host = domains[0]
+        started.add((window, host))
+        if started == set(filters):
+            all_started.set()
+        await release.wait()
+        return [SearchResult("tavily", f"https://{host}/{window}-result", "并行检索夹具", "示例摘要", 0, published)]
+
+    with config.use_settings(ESCALATE_COUNT=1, ADAPTIVE_ROUTING=False, PAID_PROVIDERS=("tavily",)):
+        with patch.dict(providers.REGISTRY, {"tavily": (capture, providers.REGISTRY["tavily"][1])}):
+            jobs = [asyncio.create_task(server.web_search(query, search_mode="escalate", time_range=window, domains=[host]))
+                    for window, host in filters]
+            try:
+                await asyncio.wait_for(all_started.wait(), timeout=3)
+            finally:
+                release.set()
+                replies = await asyncio.gather(*jobs)
+    for (window, host), reply in zip(filters, replies):
+        url = f"https://{host}/{window}-result"
+        assert url in reply and "沿用此前结果" not in reply, reply
+        for other_window, other_host in filters:
+            if (other_window, other_host) != (window, host):
+                assert f"https://{other_host}/{other_window}-result" not in reply, reply
+    assert not server._SERIAL, server._SERIAL
+
+
 @case("成本如实：key 在冷却或到量、请求没发出去时，不算动用了 key")
 async def t_cost_only_counts_sent():
     from . import providers, server, usage
@@ -841,7 +1091,7 @@ async def t_keys_tried():
     from . import config, providers
     from .providers.base import ProviderError
 
-    for key in config.API_KEYS["tavily"]:
+    for key in config.get_settings().API_KEYS["tavily"]:
         FAKES.key_errors[key] = ProviderError("HTTP 402: quota exhausted", status=402)
     _, errors, records = await providers.run_search(["tavily"], "问题", 3)
     record = records[0]
@@ -867,17 +1117,13 @@ async def t_fetch_recheck_once():
 
 @case("抓取：WEB_FETCH_PROVIDER 点名的首选后端不受「带 key 后端上限」约束")
 async def t_fetch_preferred_exempt():
-    from . import server
+    from . import config, server
     from .providers.base import ProviderError
 
-    saved = server.FETCH_PREFERRED, server.FETCH_KEYED_FALLBACKS
-    server.FETCH_PREFERRED, server.FETCH_KEYED_FALLBACKS = ["exa"], 0
     for name in ("exa", "parallel", "keenable", "tavily", "jina", "firecrawl"):
         FAKES.fetch_errors[name] = ProviderError("HTTP 422: could not be resolved", status=422)
-    try:
+    with config.use_settings(FETCH_PREFERRED=("exa",), FETCH_KEYED_FALLBACKS=0):
         text = await server.web_fetch("https://example.invalid/a")
-    finally:
-        server.FETCH_PREFERRED, server.FETCH_KEYED_FALLBACKS = saved
     assert [name for name, _ in FAKES.fetch_calls] == ["exa", "parallel", "keenable"], FAKES.fetch_calls
     assert "为节省额度，没有继续尝试 tavily（key）" in text, text
 
@@ -974,23 +1220,19 @@ def t_business_status():
     # 状态码是从文案里猜的（soft）：最多按额度冷却，不会把 key 封一整天
     soft = keypool.KeyPool("demo-soft", ["soft-demo-key-0001"])
     soft.record_failure("soft-demo-key-0001", 401, "unauthorized", soft=True)
-    assert soft.earliest_reset() - time.time() <= config.QUOTA_COOLDOWN + 5
+    assert soft.earliest_reset() - time.time() <= config.get_settings().QUOTA_COOLDOWN + 5
     hard = keypool.KeyPool("demo-hard", ["hard-demo-key-0001"])
     hard.record_failure("hard-demo-key-0001", 401, "unauthorized")
-    assert hard.earliest_reset() - time.time() > config.QUOTA_COOLDOWN + 5
+    assert hard.earliest_reset() - time.time() > config.get_settings().QUOTA_COOLDOWN + 5
 
 
 @case("补搜名单里没写到的厂商，配了 key 也会被用上；明确排除的不会")
 def t_escalation_covers_all_keyed():
-    from . import providers, routing, server
+    from . import config, providers, server
 
     assert providers.has_keys("perplexity")                      # 沙盒里配了 key，但默认被排除
-    saved = routing.PAID_PROVIDERS, routing.DOMESTIC_PROVIDERS, routing.GLOBAL_PROVIDERS
-    routing.PAID_PROVIDERS, routing.DOMESTIC_PROVIDERS, routing.GLOBAL_PROVIDERS = ["volcengine"], [], []
-    try:
+    with config.use_settings(PAID_PROVIDERS=("volcengine",), DOMESTIC_PROVIDERS=(), GLOBAL_PROVIDERS=()):
         ordered, _ = server._escalation_order("MCP 协议是什么", "auto")
-    finally:
-        routing.PAID_PROVIDERS, routing.DOMESTIC_PROVIDERS, routing.GLOBAL_PROVIDERS = saved
     assert ordered[0] == "volcengine", ordered
     for name in ("tavily", "querit", "exa", "firecrawl", "jina", "parallel"):
         assert name in ordered, (name, ordered)
@@ -1011,7 +1253,7 @@ async def t_no_cross_host_redirect_with_key():
     from .providers import _keep_keys_on_host
     from .providers.base import ProviderError
 
-    key = config.API_KEYS["exa"][0]
+    key = config.get_settings().API_KEYS["exa"][0]
     seen: list[tuple[str, bool]] = []          # [(主机, 这次请求里有没有带 key)]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1072,21 +1314,19 @@ async def t_no_cross_host_redirect_with_key():
     assert response.status_code == 200 and seen[-1] == ("elsewhere.example", False), seen
 
 
-@case("工具说明跟着本机的默认模式走，不会在默认是 all 时还说「不消耗额度」")
-def t_description_follows_mode():
-    from . import server
+@case("默认模式热变更不会让 MCP 静态说明承诺旧设置")
+async def t_description_follows_mode():
+    from . import config, server
 
-    assert "auto（默认）" in server._search_description()
-    saved = server.SEARCH_MODE
-    server.SEARCH_MODE = "all"
-    try:
-        text = server._search_description()
-    finally:
-        server.SEARCH_MODE = saved
-    assert "all（默认）" in text and "auto（默认）" not in text, text
-    assert "本机把默认模式设成了 all" in text and "默认先做匿名搜索" not in text, text
-    fetch = server._fetch_description()
-    assert "parallel（匿名） → keenable（匿名） → tavily（key）" in fetch, fetch
+    async def descriptions():
+        return {tool.name: tool.description for tool in await server.mcp.list_tools()}
+
+    before = await descriptions()
+    with config.use_settings(SEARCH_MODE="all"):
+        assert await descriptions() == before
+        status = await server.web_status()
+    assert "web_status" in before["web_search"] and "web_status" in before["web_fetch"]
+    assert any("默认" in line and "all" in line for line in status.splitlines()), status
 
 
 @case("握手时报的是本服务的版本号，日志在没有 stderr 时也不会写进协议通道")
@@ -1113,9 +1353,9 @@ def t_version_and_log():
 def t_corrupt_state_files():
     import time
 
-    from . import config, keypool, store, usage
+    from . import config, store, usage
 
-    # 直接往数据库塞非法值：过期的、NaN、类型不对的条目都应当被忽略
+    # 直接写入坏的 SQLite 值，验证实际读库路径，而不是模拟旧版进程内缓存。
     conn = store._connect()
     assert conn is not None, "数据库应当可用"
     now = time.time()
@@ -1123,35 +1363,15 @@ def t_corrupt_state_files():
         "INSERT OR REPLACE INTO key_state (provider, fingerprint, code, message, reset_at)"
         " VALUES (?, ?, ?, ?, ?)",
         [
-            ("tavily", "aaaa", "invalid", "", now - 10),      # 已过期
-            ("tavily", "bbbb", "rate", "", now + 60),         # 有效
-            # 存不进去的 NaN 会让 INSERT 失败，这里用一个"能存进去但已过期"的值代替，
-            # 真正的 NaN 防护在 _load_state 的类型转换里（见下面的断言）
-            ("tavily", "cccc", "quota", "", now - 1),
+            ("tavily", "aaaa", "invalid", "", now - 10),
+            ("tavily", "bbbb", "rate", "", now + 60),
+            ("tavily", "cccc", "quota", "", "not-a-timestamp"),
+            ("tavily", "dddd", "rate", "", float("inf")),
         ],
     )
     conn.commit()
-    keypool._CACHE, keypool._CACHE_MTIME = None, -1.0
-    states = keypool._load_state()
+    states = store.load_key_state()
     assert list(states.get("tavily", {})) == ["bbbb"], states
-
-    # 数据库里出现类型不对 / NaN 的 reset_at 时，读取要能容错而不是崩溃
-    from . import store as _store
-    fake = {"tavily": {
-        "ok": {"code": "rate", "message": "", "reset_at": time.time() + 60},
-        "bad1": {"code": "", "message": "", "reset_at": "oops"},
-        "bad2": {"code": "", "message": "", "reset_at": float("nan")},
-        "gone": {"code": "", "message": "", "reset_at": time.time() - 5},
-    }}
-    saved_load = _store.load_key_state
-    _store.load_key_state = lambda: fake
-    keypool._CACHE, keypool._CACHE_MTIME = None, -1.0
-    try:
-        tolerant = keypool._load_state()
-    finally:
-        _store.load_key_state = saved_load
-        keypool._CACHE, keypool._CACHE_MTIME = None, -1.0
-    assert list(tolerant.get("tavily", {})) == ["ok"], tolerant
 
     day, month = time.strftime("%Y-%m-%d"), time.strftime("%Y-%m")
     conn.execute("DELETE FROM usage_counters")
@@ -1162,13 +1382,15 @@ def t_corrupt_state_files():
             ("day", day, "tavily", "z", 5),
             ("month", month, "tavily", "z", 7),
             ("day", "2000-01-01", "tavily", "old", 99),   # 过期周期应被忽略
+            ("day", day, "tavily", "damaged", "not-a-count"),
         ],
     )
     conn.commit()
-    usage._CACHE, usage._CACHE_MTIME = None, -1.0
     assert usage.used("tavily", "z") == (5, 7), usage.used("tavily", "z")
     assert usage.used("tavily", "old") == (0, 0)
     assert usage.used("tavily", "nonexistent") == (0, 0)
+    assert usage.used("tavily", "damaged") == (0, 0)
+    assert store.read_provider_state("tavily").used("damaged") == (None, 0)
 
     # usage.jsonl 里混进坏行时，只跳过坏行
     config.USAGE_LOG_FILE.write_text(
@@ -1186,25 +1408,21 @@ def t_corrupt_state_files():
 
 @case("默认模式设成 free 时，抓取也不发送账号 key")
 async def t_fetch_respects_free():
-    from . import providers, server
+    from . import config, providers, server
 
-    saved = server.SEARCH_MODE, server.FETCH_PREFERRED
-    server.SEARCH_MODE, server.FETCH_PREFERRED = "free", ["tavily", "parallel"]
-    try:
+    with config.use_settings(SEARCH_MODE="free", FETCH_PREFERRED=("tavily", "parallel")):
         chain = server.fetch_chain()
         refused = await server.web_fetch("https://example.com/a", "tavily")
         await server.web_fetch("https://example.com/a", "parallel")
-        description = server._fetch_description()
-        search_description = server._search_description()
-    finally:
-        server.SEARCH_MODE, server.FETCH_PREFERRED = saved
+        await server.web_search("本机默认搜索模式")
+        assert FAKES.calls and not _keyed(), FAKES.calls
+        FAKES.calls.clear()
+        # SEARCH_MODE 只是默认值：调用方仍可显式选 all，不等于机器硬锁。
+        await server.web_search("显式搜索模式", search_mode="all")
+        assert "tavily" in _keyed(), FAKES.calls
     assert chain == [("parallel", True), ("keenable", True)], chain
     assert "必须带 key 才能抓取" in refused, refused
     assert providers.has_keys("parallel") and FAKES.fetch_calls == [("parallel", "")], FAKES.fetch_calls
-    assert "抓取只走匿名后端" in description, description
-    assert "只能指定可匿名使用的后端" in description and "就会带 key" not in description, description
-    assert "点名的厂商也只做匿名调用" in search_description, search_description
-    assert "配了 key 的会带 key" not in search_description, search_description
 
 
 @case("配置文件是 UTF-16 或 GBK 编码时也能读出来，读不了会明确告警")
@@ -1271,51 +1489,40 @@ def t_blank_config_uses_default():
         os.environ.pop(name, None)
 
 
-@case("客户端传入的环境变量优先于 .env；传空串不算数")
-def t_env_precedence():
+@case("读取 .env 只返回配置映射，不会改写客户端进程环境")
+def t_dotenv_read_does_not_mutate_env():
     from . import config
 
-    sample = Path(os.environ["AGGREGATE_SEARCH_HOME"]) / "precedence-sample.env"
+    sample = config.CONFIG_DIR / "precedence-sample.env"
     names = ("SELFTEST_FROM_CLIENT", "SELFTEST_BLANK_IN_CLIENT", "SELFTEST_ONLY_IN_FILE")
     sample.write_text("".join(f"{name}=from-file\n" for name in names), encoding="utf-8")
-    saved = config.ACTIVE_ENV_FILE
-    os.environ[names[0]] = "from-client"
-    os.environ[names[1]] = ""
-    os.environ.pop(names[2], None)
-    config.ACTIVE_ENV_FILE = sample
     try:
-        config._load_dotenv()
-        assert [os.environ[name] for name in names] == ["from-client", "from-file", "from-file"]
+        with patch.dict(os.environ, {names[0]: "from-client", names[1]: ""}):
+            assert config._load_dotenv(sample) == dict.fromkeys(names, "from-file")
+            assert [os.environ.get(name) for name in names] == ["from-client", "", None]
     finally:
-        config.ACTIVE_ENV_FILE = saved
-        for name in names:
-            os.environ.pop(name, None)
         sample.unlink(missing_ok=True)
 
 
 @case("auto：第一阶段没有可查的厂商时，直接进入补搜而不是放弃")
 async def t_auto_empty_first_stage():
-    from . import server
+    from . import config, server
 
-    saved = server.FREE_PROVIDERS
-    server.FREE_PROVIDERS = []
-    try:
+    with config.use_settings(FREE_PROVIDERS=()):
         text = await server.web_search("MCP 协议是什么")
-    finally:
-        server.FREE_PROVIDERS = saved
     assert _keyed() == ["volcengine", "querit", "tavily"], FAKES.calls
     assert "阶段: 补搜(volcengine, querit, tavily)" in text, text
 
 
 @case("缓存里的「试过」只记实际发出的请求，没发出去的通道过一会儿还能再试")
 async def t_cache_marks_only_sent():
-    import time
-
     from . import providers, server
+    from .providers.base import ProviderError
 
     query = "MCP 协议是什么"
-    providers._ANON_COOLDOWN["parallel"] = time.time() + 60     # 匿名通道冷却中，配了 key
-    providers._ANON_COOLDOWN["keenable"] = time.time() + 60     # 匿名通道冷却中，没有 key
+    limited = ProviderError("匿名暂时限流", status=429, retry_after=60)
+    providers._note_anon_failure("parallel", limited)     # 匿名通道冷却中，配了 key
+    providers._note_anon_failure("keenable", limited)     # 匿名通道冷却中，没有 key
     await server.web_search(query)
     assert [key for name, key in FAKES.calls if name == "parallel"] != [""], FAKES.calls
     _, tried, _ = server._recall(query)
@@ -1326,19 +1533,15 @@ async def t_cache_marks_only_sent():
 
 @case("排队等上一次 escalate 的时间也算进总时限")
 async def t_queue_time_counts():
-    from . import server
+    from . import config, server
 
-    saved = server.TOTAL_TIMEOUT, server._MIN_ROUND_SECONDS
-    server.TOTAL_TIMEOUT, server._MIN_ROUND_SECONDS = 0.6, 0.4
     FAKES.delay = 0.3
     query = "MCP 协议是什么"
-    try:
+    with config.use_settings(TOTAL_TIMEOUT=0.6), patch.object(server, "_MIN_ROUND_SECONDS", 0.4):
         first, second = await asyncio.gather(
             server.web_search(query, search_mode="escalate"),
             server.web_search(query, search_mode="escalate"),
         )
-    finally:
-        server.TOTAL_TIMEOUT, server._MIN_ROUND_SECONDS = saved
     # 第二个排队等了 0.3 秒，剩下的时间不够再开一轮：带着第一个的结果返回，不再花额度
     assert _keyed() == ["volcengine", "querit", "tavily"], FAKES.calls
     assert "阶段: 补搜(volcengine, querit, tavily)" in first, first
@@ -1390,6 +1593,122 @@ def _rpc(result=None, error=None) -> dict:
     message = {"jsonrpc": "2.0", "id": 1}
     message.update({"error": error} if error is not None else {"result": result})
     return message
+
+
+@case("Parallel 无状态快路径：匿名和账号各只做一次工具调用，认证失败不误触发握手")
+async def t_parallel_fast_paths():
+    import json
+
+    import httpx
+
+    from .providers import parallel
+    from .providers.base import ProviderError
+
+    key, rejected = _fake_key("parallel", 1), _fake_key("parallel-rejected")
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        packet = json.loads(request.content)
+        requests.append((packet["method"], request.headers.get("Authorization"), request.headers.get("Mcp-Session-Id")))
+        if request.headers.get("Authorization") == f"Bearer {rejected}":
+            return httpx.Response(401, json={"error": "Unauthorized: Session ID required for account access"})
+        return httpx.Response(200, json=_rpc(result={"structuredContent": {"results": [
+            {"url": "https://docs.example/parallel", "title": "会话快速路径", "excerpts": ["普通文档"]},
+        ]}}))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        for identity in ("", key):
+            hits = await parallel.search(client, identity, "会话快速路径", 3)
+            assert len(hits) == 1 and hits[0].title == "会话快速路径", hits
+        try:
+            await parallel.search(client, rejected, "认证检查", 3)
+        except ProviderError as exc:
+            assert exc.status == 401
+        else:
+            raise AssertionError("应保留 401 认证失败")
+    assert requests == [("tools/call", auth, None) for auth in (None, f"Bearer {key}", f"Bearer {rejected}")], requests
+
+
+@case("Parallel 匿名与两 Key 的 MCP 会话按身份、客户端隔离；同身份并发合并握手")
+async def t_parallel_session_isolation():
+    import json
+    from collections import Counter
+
+    import httpx
+
+    from .providers import parallel
+
+    first_key, second_key = (_fake_key("parallel", i) for i in (1, 2))
+    auth = {"": None, first_key: f"Bearer {first_key}", second_key: f"Bearer {second_key}"}
+    initialized = Counter()
+    notified = Counter()
+    accepted: dict[tuple[str, str | None], set[str]] = {}
+    tool_sessions: dict[tuple[str, str | None], set[str]] = {}
+    started, release, joined = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    def transport(connection):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            packet = json.loads(request.content)
+            method = packet["method"]
+            identity = (connection, request.headers.get("Authorization"))
+            assert identity[1] in auth.values() and "cookie" not in request.headers, request.headers
+            session = request.headers.get("Mcp-Session-Id")
+            sessions = accepted.setdefault(identity, set())
+            if method == "initialize":
+                assert session is None, (identity, session)
+                initialized[identity] += 1
+                label = f"session-{sum(initialized.values())}"
+                if identity == ("primary", auth[first_key]):
+                    started.set()
+                    await release.wait()
+                sessions.add(label)
+                return httpx.Response(200, headers={"Mcp-Session-Id": label, "set-cookie": "demo=fixture; Path=/"},
+                                      json=_rpc(result={"protocolVersion": "2025-06-18"}))
+            if method == "notifications/initialized":
+                assert session in sessions and request.headers.get("MCP-Protocol-Version") == "2025-06-18"
+                notified[identity] += 1
+                return httpx.Response(202)
+
+            assert method == "tools/call", packet
+            tool_sessions.setdefault(identity, set()).add(packet["params"]["arguments"]["session_id"])
+            if not session:
+                return httpx.Response(400, json={"error": "Missing MCP session ID"})
+            assert session in sessions and notified[identity], (identity, session, accepted)
+            assert request.headers.get("MCP-Protocol-Version") == "2025-06-18"
+            if packet["params"]["name"] == "web_fetch":
+                return httpx.Response(200, json=_rpc(result={"structuredContent": {"pages": [{"content": "测试正文"}]}}))
+            return httpx.Response(200, json=_rpc(result={"structuredContent": {"results": [
+                {"url": "https://docs.example/session", "title": "会话示例"},
+            ]}}))
+        return httpx.MockTransport(handler)
+
+    async with httpx.AsyncClient(transport=transport("primary")) as primary:
+        async def concurrent_fetch():
+            joined.set()
+            return await parallel.fetch(primary, first_key, "https://docs.example/session")
+
+        pending = [asyncio.create_task(parallel.search(primary, first_key, "握手示例", 3))]
+        try:
+            await asyncio.wait_for(started.wait(), timeout=3)
+            pending.append(asyncio.create_task(concurrent_fetch()))
+            await asyncio.wait_for(joined.wait(), timeout=3)
+            # 首个身份的握手挂起时，另外两个身份仍能独立完成完整握手。
+            for identity in ("", second_key):
+                assert await asyncio.wait_for(parallel.search(primary, identity, "独立身份", 3), timeout=3)
+        finally:
+            release.set()
+            completed = await asyncio.gather(*pending)
+        hits, fetched = completed
+        assert hits and fetched.content == "测试正文"
+        for identity in ("", first_key, second_key):
+            assert await parallel.search(primary, identity, "复用会话", 3)
+        async with httpx.AsyncClient(transport=transport("secondary")) as secondary:
+            assert await parallel.search(secondary, first_key, "新连接", 3)
+
+    channels = {("primary", value) for value in auth.values()} | {("secondary", auth[first_key])}
+    assert initialized == notified == Counter(dict.fromkeys(channels, 1)), (initialized, notified)
+    assert all(len(accepted[channel]) == len(tool_sessions[channel]) == 1 for channel in channels), tool_sessions
+    assert len({next(iter(tool_sessions[channel])) for channel in channels}) == 4, tool_sessions
 
 
 # 上游可能回来的各种「不对劲」的响应。适配器遇到它们，只允许正常返回或抛 ProviderError，
@@ -1495,49 +1814,44 @@ def _wrong_typed_responses() -> list[tuple[int, object]]:
 
 @case("真实适配器：19 家遇到各种异常响应，都只会正常返回或报「调用失败」，不会冒出程序错误")
 async def t_adapters_survive_odd_responses():
-    from .providers import parallel
     from .providers.base import FetchResult, ProviderError, SearchResult
 
     assert len(REAL) == 19, len(REAL)
-    saved = parallel._handshake_required
     problems: list[str] = []
     calls = 0
-    try:
-        for index, (status, body) in enumerate(_ODD_RESPONSES + _wrong_typed_responses()):
-            async with _mock_client(status, body) as client:
-                for name, (search_fn, fetch_fn) in REAL.items():
-                    for key in ("", _fake_key(name)):
-                        jobs = [("search", search_fn, (client, key, "测试问题", 5))]
-                        if fetch_fn:
-                            jobs.append(("fetch", fetch_fn, (client, key, "https://example.com/a")))
-                        for kind, fn, args in jobs:
-                            calls += 1
-                            try:
-                                value = await fn(*args)
-                            except ProviderError as exc:
-                                if _fake_key(name) in str(exc):
-                                    problems.append(f"{name}.{kind} 响应#{index}: 报错里带出了 key")
-                                continue
-                            except Exception as exc:
-                                problems.append(
-                                    f"{name}.{kind} 响应#{index}（HTTP {status}）: {type(exc).__name__}: {exc}"
-                                )
-                                continue
-                            if kind == "search":
-                                if not isinstance(value, list) or not all(
-                                    isinstance(item, SearchResult) for item in value
-                                ):
-                                    problems.append(f"{name}.search 响应#{index}: 返回的不是结果列表")
-                                elif not all(
-                                    isinstance(item.url, str) and isinstance(item.title, str)
-                                    and isinstance(item.snippet, str) and isinstance(item.published, str)
-                                    for item in value
-                                ):
-                                    problems.append(f"{name}.search 响应#{index}: 结果里的字段不是文本")
-                            elif not isinstance(value, FetchResult) or not isinstance(value.content, str):
-                                problems.append(f"{name}.fetch 响应#{index}: 返回的不是抓取结果")
-    finally:
-        parallel._handshake_required = saved
+    for index, (status, body) in enumerate(_ODD_RESPONSES + _wrong_typed_responses()):
+        async with _mock_client(status, body) as client:
+            for name, (search_fn, fetch_fn) in REAL.items():
+                for key in ("", _fake_key(name)):
+                    jobs = [("search", search_fn, (client, key, "测试问题", 5))]
+                    if fetch_fn:
+                        jobs.append(("fetch", fetch_fn, (client, key, "https://example.com/a")))
+                    for kind, fn, args in jobs:
+                        calls += 1
+                        try:
+                            value = await fn(*args)
+                        except ProviderError as exc:
+                            if _fake_key(name) in str(exc):
+                                problems.append(f"{name}.{kind} 响应#{index}: 报错里带出了 key")
+                            continue
+                        except Exception as exc:
+                            problems.append(
+                                f"{name}.{kind} 响应#{index}（HTTP {status}）: {type(exc).__name__}: {exc}"
+                            )
+                            continue
+                        if kind == "search":
+                            if not isinstance(value, list) or not all(
+                                isinstance(item, SearchResult) for item in value
+                            ):
+                                problems.append(f"{name}.search 响应#{index}: 返回的不是结果列表")
+                            elif not all(
+                                isinstance(item.url, str) and isinstance(item.title, str)
+                                and isinstance(item.snippet, str) and isinstance(item.published, str)
+                                for item in value
+                            ):
+                                problems.append(f"{name}.search 响应#{index}: 结果里的字段不是文本")
+                        elif not isinstance(value, FetchResult) or not isinstance(value.content, str):
+                            problems.append(f"{name}.fetch 响应#{index}: 返回的不是抓取结果")
     assert calls > 3000, calls
     assert not problems, f"共 {len(problems)} 处:\n  " + "\n  ".join(sorted(set(problems))[:40])
 
@@ -1643,11 +1957,9 @@ async def t_adapters_parse_normal():
             {"results": [dict(page, excerpts=[snippet])]})}]}),
     }
     assert set(samples) == set(REAL), f"漏测的厂商: {sorted(set(REAL) - set(samples))}；多出的: {sorted(set(samples) - set(REAL))}"
-    from .providers import searxng
+    from . import config
 
-    saved_base = searxng.SEARXNG_BASE_URL
-    searxng.SEARXNG_BASE_URL = "https://searx.example.com"  # 沙盒里没配实例地址，测试时临时给一个
-    try:
+    with config.use_settings(SEARXNG_BASE_URL="https://searx.example.com"):  # 给测试专用地址
         for name, body in samples.items():
             async with _mock_client(200, body) as client:
                 results = await REAL[name][0](client, _fake_key(name), "测试问题", 5)
@@ -1661,8 +1973,6 @@ async def t_adapters_parse_normal():
                 continue
             assert len(results) == 1, (name, len(results), results)
             assert first.url == url and first.title == title, (name, first)
-    finally:
-        searxng.SEARXNG_BASE_URL = saved_base
 
 
 @case("真实适配器：博查正常返回整数 code=200 时不再被当成错误")
@@ -1695,24 +2005,19 @@ async def t_bocha_code_200():
 def t_config_spelling_warnings():
     from . import config
 
-    # 直接调校验函数，避免污染真实模块级状态
-    saved = (
-        config.FREE_PROVIDERS, config.PAID_PROVIDERS, config.DOMESTIC_PROVIDERS,
-        config.GLOBAL_PROVIDERS, config.SEARCH_PROVIDERS_LIMIT, config.FETCH_PREFERRED,
-    )
     before = len(config.WARNINGS)
     try:
-        config.FREE_PROVIDERS = ["parallel", "paralel", "keenable"]
-        config.PAID_PROVIDERS = ["volcengine", "tavly"]
-        config.DOMESTIC_PROVIDERS = ["baidu", "火山"]
-        config.GLOBAL_PROVIDERS = ["tavily", "exa"]
-        config.SEARCH_PROVIDERS_LIMIT = ["tavily", "nope"]
-        config.FETCH_PREFERRED = ["tavily", "baidu"]      # baidu 没有抓取接口
-        problems = config.check_provider_names()
+        with config.use_settings(
+            FREE_PROVIDERS=("parallel", "paralel", "keenable"),
+            PAID_PROVIDERS=("volcengine", "tavly"),
+            DOMESTIC_PROVIDERS=("baidu", "火山"),
+            GLOBAL_PROVIDERS=("tavily", "exa"),
+            SEARCH_PROVIDERS_LIMIT=("tavily", "nope"),
+            FETCH_PREFERRED=("tavily", "baidu"),  # baidu 没有抓取接口
+        ):
+            problems = config.check_provider_names()
         added = config.WARNINGS[before:]
     finally:
-        (config.FREE_PROVIDERS, config.PAID_PROVIDERS, config.DOMESTIC_PROVIDERS,
-         config.GLOBAL_PROVIDERS, config.SEARCH_PROVIDERS_LIMIT, config.FETCH_PREFERRED) = saved
         del config.WARNINGS[before:]
 
     text = " | ".join(problems)
@@ -1729,23 +2034,17 @@ def t_config_spelling_warnings():
 def t_config_spelling_clean():
     from . import config
 
-    saved = (
-        config.FREE_PROVIDERS, config.PAID_PROVIDERS, config.DOMESTIC_PROVIDERS,
-        config.GLOBAL_PROVIDERS, config.SEARCH_PROVIDERS_LIMIT, config.FETCH_PREFERRED,
-    )
     before = len(config.WARNINGS)
-    try:
-        config.FREE_PROVIDERS = ["parallel", "keenable", "anysearch"]
-        config.PAID_PROVIDERS = ["volcengine", "querit", "tavily"]
-        config.DOMESTIC_PROVIDERS = ["baidu", "volcengine"]
-        config.GLOBAL_PROVIDERS = ["tavily", "exa"]
-        config.SEARCH_PROVIDERS_LIMIT = None
-        config.FETCH_PREFERRED = ["tavily", "jina"]
+    with config.use_settings(
+        FREE_PROVIDERS=("parallel", "keenable", "anysearch"),
+        PAID_PROVIDERS=("volcengine", "querit", "tavily"),
+        DOMESTIC_PROVIDERS=("baidu", "volcengine"),
+        GLOBAL_PROVIDERS=("tavily", "exa"),
+        SEARCH_PROVIDERS_LIMIT=None,
+        FETCH_PREFERRED=("tavily", "jina"),
+    ):
         assert config.check_provider_names() == []
-        assert len(config.WARNINGS) == before, config.WARNINGS[before:]
-    finally:
-        (config.FREE_PROVIDERS, config.PAID_PROVIDERS, config.DOMESTIC_PROVIDERS,
-         config.GLOBAL_PROVIDERS, config.SEARCH_PROVIDERS_LIMIT, config.FETCH_PREFERRED) = saved
+    assert len(config.WARNINGS) == before, config.WARNINGS[before:]
 
 
 @case("地域识别：「go」当日常动词时不误判，Go 语言/版本号正常命中")
@@ -1833,17 +2132,53 @@ async def t_untrusted_in_fetch():
     assert "&lt;/untrusted_content&gt;" in text
 
 
+@case("外部标题与正文留在证据边界内，普通 Markdown 标点不能拆开链接")
+async def t_evidence_markdown_boundaries():
+    import re
+
+    from . import providers, server
+    from .providers.base import FetchResult, SearchResult
+
+    title = "目录 [卷二] (修订)\n# 附录"
+    url = "https://docs.example/review(2)"
+    snippet = "用 `x < y` 说明目录中的数学符号。"
+    body = "## 正文小节\n\n- " + snippet
+    escaped_title = r"目录 \[卷二\] \(修订\) \# 附录"
+    safe_target = "https://docs.example/review%282%29"
+    evidence = re.compile(r"<untrusted_content(?: [^>]*?)?>(.*?)</untrusted_content>", re.S)
+
+    async def search(client, key, query, maximum):
+        return [SearchResult("keenable", url, title, snippet, 0)]
+
+    async def fetch(client, key, target):
+        return FetchResult("keenable", target, title, body)
+
+    with patch.dict(providers.REGISTRY, {"keenable": (search, fetch)}):
+        searched = await server.web_search("目录", providers=["keenable"])
+        fetched = await server.web_fetch(url, "keenable")
+        cached = await server.web_fetch(url, "keenable")
+    for text in (searched, fetched, cached):
+        blocks = evidence.findall(text)
+        outside = evidence.sub("", text)
+        assert blocks and all(marker not in outside for marker in ("卷二", "修订", "正文小节", "数学符号")), text
+        assert any(escaped_title in block for block in blocks), blocks
+        assert any(snippet in block for block in blocks), blocks
+        assert sum(block.count(f"]({safe_target})") for block in blocks) == 1, blocks
+    assert "缓存命中" in cached and body in fetched and body in cached, (fetched, cached)
+
+
 @case("未实测厂商排在实测厂商之后、但仍可使用，并在状态页标注")
 def t_unverified_ordering():
     from . import config, routing, server
 
-    assert {"yuanbao", "zhipu", "bocha"} <= config.UNVERIFIED_PROVIDERS, config.UNVERIFIED_PROVIDERS
-    assert "volcengine" not in config.UNVERIFIED_PROVIDERS
+    settings = config.get_settings()
+    assert {"yuanbao", "zhipu", "bocha"} <= settings.UNVERIFIED_PROVIDERS, settings.UNVERIFIED_PROVIDERS
+    assert "volcengine" not in settings.UNVERIFIED_PROVIDERS
     # 默认补搜顺序里，已实测的付费厂商要排在所有未实测厂商之前
-    paid = config.PAID_PROVIDERS
-    verified_paid = [n for n in paid if n not in config.UNVERIFIED_PROVIDERS
+    paid = settings.PAID_PROVIDERS
+    verified_paid = [n for n in paid if n not in settings.UNVERIFIED_PROVIDERS
                      and n not in ("parallel", "keenable", "anysearch")]
-    unverified = [n for n in paid if n in config.UNVERIFIED_PROVIDERS]
+    unverified = [n for n in paid if n in settings.UNVERIFIED_PROVIDERS]
     assert verified_paid and unverified, paid
     assert max(paid.index(n) for n in verified_paid) < min(paid.index(n) for n in unverified), paid
 
@@ -1877,29 +2212,78 @@ async def t_time_range_param():
     assert FAKES.calls == [], FAKES.calls
 
 
-@case("domains 规范化：去协议、去通配、小写去重")
+@case("域名规范化：去协议、去通配、小写去重，筛选顺序不影响规范值")
 def t_domains_normalize():
     from .providers.base import normalize_domains
 
-    assert normalize_domains(["https://Example.com/a/b", "*.foo.cn", "example.com", "x", "a.b.c"]) == (
-        "example.com", "foo.cn", "a.b.c"
-    )
+    domains = ["https://Example.com/a/b", "*.foo.cn", "example.com", "x", "a.b.c"]
+    actual = normalize_domains(domains)
+    assert set(actual) == {"example.com", "foo.cn", "a.b.c"} and len(actual) == 3, actual
+    assert normalize_domains(list(reversed(domains))) == actual
     assert normalize_domains(None) == ()
     assert normalize_domains([]) == ()
 
 
-@case("带时间/站点过滤时，支持原生过滤的厂商收到原生参数")
+@case("时间与域名原生能力分别登记，筛选上下文按请求隔离")
 async def t_native_filters():
-    from .providers.base import NATIVE_FILTER_PROVIDERS, current_filters, set_filters, reset_filters
+    from .providers.base import NATIVE_DOMAIN_PROVIDERS, current_filters, set_filters, reset_filters
 
-    assert {"tavily", "exa", "brave", "bocha", "volcengine", "firecrawl", "perplexity", "searxng"} \
-        == set(NATIVE_FILTER_PROVIDERS)
+    assert set(NATIVE_DOMAIN_PROVIDERS) == {"tavily", "exa", "perplexity"}, NATIVE_DOMAIN_PROVIDERS
     token = set_filters("week", ["example.com", "docs.python.org"])
     try:
-        assert current_filters() == ("week", ("example.com", "docs.python.org"))
+        window, domains = current_filters()
+        assert window == "week" and set(domains) == {"example.com", "docs.python.org"}, (window, domains)
     finally:
         reset_filters(token)
     assert current_filters() == ("", ()), "过滤条件应当在 reset 后清空"
+
+
+@case("五家非原生域名适配器实际发送 site:，时间参数与不加域名时一致")
+async def t_domain_fallback_wire_parameters():
+    import json
+    from contextlib import asynccontextmanager
+
+    import httpx
+
+    from . import config, providers
+
+    # (URL 主机, 查询字段, 时间字段, 一周的原生值, 正常空响应)；全部由本地 MockTransport 回应。
+    examples = {
+        "brave": ("api.search.brave.com", "q", "freshness", "pw", {"web": {"results": []}}),
+        "bocha": ("api.bochaai.com", "query", "freshness", "oneWeek", {"code": 200, "webPages": {"value": []}}),
+        "volcengine": ("open.feedcoopapi.com", "Query", "TimeRange", 2, {"Result": {"WebResults": []}}),
+        "firecrawl": ("api.firecrawl.dev", "query", "tbs", "qdr:w", {"success": True, "data": {"web": []}}),
+        "searxng": ("searx.example", "q", "time_range", "week", {"results": []}),
+    }
+    by_host = {fixture[0]: name for name, fixture in examples.items()}
+    seen = {name: [] for name in examples}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        name = by_host[request.url.host]
+        values = dict(request.url.params) if request.method == "GET" else json.loads(request.content)
+        seen[name].append(values)
+        return httpx.Response(200, json=examples[name][-1])
+
+    @asynccontextmanager
+    async def mocked_client(name):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            yield client
+
+    query = "检索接口示例"
+    keys = {**config.get_settings().API_KEYS, "brave": (_fake_key("brave"),), "bocha": (_fake_key("bocha"),)}
+    real_adapters = {name: REAL[name] for name in examples}
+    with (config.use_settings(API_KEYS=keys, SEARXNG_BASE_URL="https://searx.example"),
+          patch.dict(providers.REGISTRY, real_adapters), patch.object(providers, "client_for", mocked_client)):
+        for domains in (None, ["docs.example", "guide.example"]):
+            _, errors, records = await providers.run_search(list(examples), query, 3, time_range="week", domains=domains)
+            assert not errors and all(record.ok and record.sent for record in records), errors
+    for name, (_, query_field, time_field, time_value, _) in examples.items():
+        plain, filtered = seen[name]
+        filtered_query = filtered.pop(query_field)
+        assert plain.pop(query_field) == query, (name, plain)
+        assert filtered_query.startswith(query) and "site:docs.example" in filtered_query, (name, filtered_query)
+        assert "site:guide.example" in filtered_query, (name, filtered_query)
+        assert plain == filtered and plain[time_field] == time_value, (name, plain, filtered)
 
 
 @case("不支持原生过滤的厂商，查询里会拼上 site:")
@@ -1923,24 +2307,31 @@ async def t_site_in_query():
 
 @case("过滤条件进入缓存键：不带过滤的结果不会混进带过滤的 escalate")
 async def t_filter_cache_isolation():
-    from . import server
+    from datetime import datetime, timedelta, timezone
+
+    from . import config, providers, server
+    from .providers.base import SearchResult
 
     query = "MCP 协议是什么"
-    await server.web_search(query)                                  # 不带过滤
-    _, tried_plain, _ = server._recall(query)
-    assert "parallel" in tried_plain, tried_plain
+    published = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
 
-    # 换一个过滤条件，应该看不到上一次的结果
-    _, tried_filtered, _ = server._recall(query, "week", ("example.com",))
-    assert not tried_filtered, tried_filtered
-    # 同一过滤条件能取到
-    await server.web_search(query, time_range="week")
-    _, tried_again, age = server._recall(query, "week")
-    assert "parallel" in tried_again, tried_again
+    async def recent(client, key, query, maximum):
+        return [SearchResult("parallel", "https://docs.example.com/recent", "MCP 近期说明", "近期笔记", 0, published)]
 
-    # 三个缓存条目互不相干
-    keys = list(server._RECENT)
-    assert len(keys) == 2, keys
+    with (config.use_settings(FREE_PROVIDERS=("parallel",), AUTO_ESCALATE_MAX=0),
+          patch.dict(providers.REGISTRY, {"parallel": (recent, providers.REGISTRY["parallel"][1])})):
+        await server.web_search(query)  # 不带过滤
+        _, tried_plain, _ = server._recall(query)
+        assert "parallel" in tried_plain, tried_plain
+
+        _, tried_filtered, _ = server._recall(query, "week", ("docs.example.com",))
+        assert not tried_filtered, tried_filtered
+        await server.web_search(query, time_range="week", domains=["docs.example.com"])
+        stored, tried_again, _ = server._recall(query, "week", ("docs.example.com",))
+        assert "parallel" in tried_again and stored["parallel"][0].url.endswith("/recent"), (stored, tried_again)
+        _, tried_no_domain, _ = server._recall(query, "week")
+        assert not tried_no_domain, tried_no_domain
+    assert len(server._RECENT) == 2, list(server._RECENT)
 
 
 @case("站点后过滤：原生过滤之外再兜一层")
@@ -1964,6 +2355,88 @@ async def t_domain_post_filter():
     assert "example.com/keep" in text and "docs.example.com/keep2" in text, text
     assert "other.org/drop" not in text, "不属于指定域名的结果没有被过滤掉"
     assert "筛选条件: 站点=example.com" in text, text
+
+
+@case("站点过滤和转载折叠都先于门禁：有 4 条原始命中不等于覆盖足够")
+async def t_gate_filters_and_folds_first():
+    from . import config, providers, server, usage
+    from .providers.base import SearchResult, merge_results
+    from .quality import assess_quality
+
+    source = "keenable"
+    query = "城市中心图书馆开放时间说明"
+    original = providers.REGISTRY[source]
+    for off_site in (True, False):
+        FAKES.calls.clear()
+        domains = ["docs.example.com"] if off_site else None
+        urls = [f"https://{'offsite' if off_site else 'reprint'}-{i}.example/story" for i in range(4)]
+        rows = [
+            SearchResult(source, url, f"{query} 第 {i} 页" if off_site else query,
+                         "开放期间可以阅读馆藏、使用阅览席，并在服务台了解借阅规定和访客须知。", i)
+            for i, url in enumerate(urls)
+        ]
+        assert assess_quality(query, merge_results({source: rows})).sufficient, "四条未处理的结果应足以通过门禁"
+
+        async def capture(client, key, effective_query, maximum):
+            FAKES.calls.append((source, key))
+            return rows[:maximum]
+
+        with config.use_settings(FREE_PROVIDERS=(source,), ADAPTIVE_ROUTING=False):
+            with patch.dict(providers.REGISTRY, {source: (capture, original[1])}):
+                reply = await server.web_search(query, max_results=4, domains=domains)
+        assert _keyed() == ["volcengine", "querit", "tavily"], (off_site, FAKES.calls)
+        event = usage.read_events(1)[-1]
+        call = next(c for c in event["calls"] if c["p"] == source)
+        assert (call["n"], call["filtered_n"]) == (4, 0 if off_site else 4), call
+        if off_site:
+            assert all(url not in reply for url in urls) and "被筛光 **1 家**" in reply, reply
+        else:
+            assert "近似重复折叠 **3 条**" in reply, reply
+
+
+@case("严格时间筛选：只留近期明确发布日期，被筛光的补搜后端不计数")
+async def t_strict_date_filter_and_backfill():
+    from datetime import datetime, timedelta, timezone
+
+    from . import config, providers, server, usage
+    from .providers.base import SearchResult
+
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(hours=2)).isoformat()
+    fixture = {
+        "recent": recent,
+        "expired": (now - timedelta(days=9)).isoformat(),
+        "missing": "",
+        "invalid": "2026-02-30",
+        "future": (now + timedelta(days=2)).isoformat(),
+        "no-zone": (now - timedelta(hours=1)).replace(tzinfo=None).isoformat(),
+    }
+
+    def fake(name):
+        async def search(client, key, query, max_results):
+            FAKES.calls.append((name, key))
+            # 即使上游支持原生时间筛选，首家返回的旧数据也不能算作有效补搜。
+            dates = {"expired": fixture["expired"]} if name == "volcengine" else fixture
+            return [SearchResult(name, f"https://docs.example.com/{name}-{label}", "检索示例",
+                                 "用于核验公开的发布日期。", rank, value)
+                    for rank, (label, value) in enumerate(dates.items())]
+        return search
+
+    order = ("volcengine", "tavily", "exa", "querit")
+    registry = {name: (fake(name), providers.REGISTRY[name][1]) for name in order}
+    with config.use_settings(PAID_PROVIDERS=order, ADAPTIVE_ROUTING=False), patch.dict(providers.REGISTRY, registry):
+        reply = await server.web_search("检索示例", search_mode="escalate", time_range="week",
+                                        domains=["docs.example.com"], max_results=len(fixture))
+    assert _keyed() == list(order), FAKES.calls
+    report = usage.read_events(1)[-1]
+    assert report["escalated"] == list(order) and report["filtered"] == 3, report
+    by_name = {c["p"]: (c["n"], c["filtered_n"], c["ok"]) for c in report["calls"]}
+    assert by_name == {"volcengine": (1, 0, True), **{name: (len(fixture), 1, True) for name in order[1:]}}, by_name
+    assert "有效返回 **3 家**" in reply and "被筛光 **1 家**" in reply, reply
+    for name in order:
+        for label in fixture:
+            visible = f"docs.example.com/{name}-{label}" in reply
+            assert visible == (name != "volcengine" and label == "recent"), (name, label, reply)
 
 
 @case("官方一手来源：同源数下排在前面，且被标注")
@@ -1998,33 +2471,32 @@ def t_official_boost():
 
 @case("抓取缓存：TTL 内同一网址不重复发请求，TTL=0 时关闭")
 async def t_fetch_cache():
-    from . import server
+    from . import config, server, usage
 
-    saved_ttl = server.FETCH_CACHE_TTL
-    try:
-        server.FETCH_CACHE_TTL = 300
-        server._fetch_cache_clear()
-        first = await server.web_fetch("https://example.com/cache-a")
+    target = "https://example.com/cache-a?page=1"
+    with config.use_settings(FETCH_CACHE_TTL=300):
+        first = await server.web_fetch(target)
         calls = len(FAKES.fetch_calls)
-        second = await server.web_fetch("https://example.com/cache-a")
-        assert len(FAKES.fetch_calls) == calls, "第二次不该再发请求"
+        second = await server.web_fetch(target)
+        assert len(FAKES.fetch_calls) == calls == 1, FAKES.fetch_calls
         assert "缓存命中" in second and "缓存命中" not in first, (first[:60], second[:60])
-        # 缓存内容仍按外部数据包裹
-        assert second.count("</untrusted_content>") == 1, second.count("</untrusted_content>")
+        assert second.count("</untrusted_content>") == 1
 
-        # 换后端参数不算同一个缓存
-        await server.web_fetch("https://example.com/cache-a", "jina")
-        assert len(FAKES.fetch_calls) > calls, "指定不同后端时应重新抓"
+        normal, hit = usage.read_events(1)
+        assert normal["attempts"] and not normal.get("cache_hit"), normal
+        assert hit["tool"] == "web_fetch" and hit["cache_hit"] is True and hit["attempts"] == [], hit
+        assert hit["backend"] == normal["backend"] and hit["url"] == "https://example.com/cache-a?…", hit
 
-        server.FETCH_CACHE_TTL = 0
-        server._fetch_cache_clear()
+        # 同一网址、不同后端参数不共用缓存。
+        await server.web_fetch(target, "jina")
+        assert len(FAKES.fetch_calls) == calls + 1, FAKES.fetch_calls
+
+    # 不清旧缓存，直接验证改为 TTL=0 后不再读取和写入。
+    with config.use_settings(FETCH_CACHE_TTL=0):
         before = len(FAKES.fetch_calls)
-        await server.web_fetch("https://example.com/cache-b")
-        await server.web_fetch("https://example.com/cache-b")
-        assert len(FAKES.fetch_calls) == before + 2, "TTL=0 不应缓存"
-    finally:
-        server.FETCH_CACHE_TTL = saved_ttl
-        server._fetch_cache_clear()
+        for _ in range(2):
+            assert "缓存命中" not in await server.web_fetch(target)
+        assert len(FAKES.fetch_calls) == before + 2, FAKES.fetch_calls
 
 
 @case("连接复用：同一事件循环内同一网络配置共用一个客户端")
@@ -2046,24 +2518,54 @@ def t_adaptive_routing():
     from . import config, routing
 
     names = ["baidu", "volcengine", "querit"]
-    # 没有数据：顺序不变
     assert routing._adaptive_order(names, {}) == names
-    # 次数不够（< 5）：不调权
-    assert routing._adaptive_order(names, {"querit": {"calls": 3, "ok_rate": 0.0}}) == names
-    # 表现差、次数够：排到组尾，但还在名单里
-    bad = routing._adaptive_order(names, {"querit": {"calls": 8, "ok_rate": 0.0}})
-    assert bad[-1] == "querit" and set(bad) == set(names), bad
-    # 表现好：略微提前
-    good = routing._adaptive_order(names, {"volcengine": {"calls": 20, "ok_rate": 1.0}})
-    assert good[0] == "volcengine", good
-    # 关掉开关后完全按静态顺序
-    saved = config.ADAPTIVE_ROUTING, routing.ADAPTIVE_ROUTING
-    config.ADAPTIVE_ROUTING = routing.ADAPTIVE_ROUTING = False
-    try:
+    # 单边没有足够样本：不能凭印象越过它。
+    assert routing._adaptive_order(names, {"volcengine": {"calls": 3, "ok_rate": 1.0}}) == names
+    assert routing._adaptive_order(names, {"volcengine": {"calls": 20, "ok_rate": 1.0}}) == names
+    stats = {
+        "baidu": {"calls": 10, "ok_rate": 0.0},
+        "volcengine": {"calls": 20, "ok_rate": 1.0},
+        "querit": {"calls": 20, "ok_rate": 1.0},
+    }
+    assert routing._adaptive_order(names, stats) == ["volcengine", "baidu", "querit"]
+    # 即使样本会改变顺序，关掉开关后仍按静态顺序。
+    with config.use_settings(ADAPTIVE_ROUTING=False), patch.object(routing, "_load_stats", return_value=stats):
         ordered, _ = routing.order_escalation("中国最新的人工智能政策")
-        assert ordered[:3] == ["baidu", "volcengine", "querit"], ordered[:3]
-    finally:
-        config.ADAPTIVE_ROUTING, routing.ADAPTIVE_ROUTING = saved
+        assert ordered[:3] == names, ordered
+
+
+@case("真实统计：正常空不是失败；稳定高延迟只在组内微降，不剔除厂商")
+def t_adaptive_empty_and_slow():
+    from . import config, routing, usage
+
+    ordered = ["volcengine", "querit", "tavily", "exa"]
+    with config.use_settings(ADAPTIVE_ROUTING=True, ADAPTIVE_MIN_CALLS=5, PAID_PROVIDERS=tuple(ordered)):
+        # 使用真实日志格式构建统计，固定耗时，既不外连也不依赖运行机器的时钟精度。
+        for _ in range(10):
+            usage.log_event({"tool": "web_search", "calls": [
+                {"p": "volcengine", "auth": "key", "ok": True, "n": 1, "ms": 12000},
+                {"p": "querit", "auth": "key", "ok": True, "n": 1, "ms": 200},
+                {"p": "tavily", "auth": "key", "ok": True, "n": 1, "ms": 200},
+                {"p": "exa", "auth": "key", "ok": True, "n": 1, "ms": 200},
+            ]})
+            usage.log_event({"tool": "web_search", "calls": [
+                {"p": "baidu", "auth": "key", "ok": True, "n": 0, "ms": 70},
+                {"p": "keenable", "auth": "anon", "ok": False, "n": 0, "ms": 70},
+                {"p": "anysearch", "auth": "anon", "ok": False, "n": 0, "ms": 0, "sent": False},
+                {"p": "querit", "auth": "key", "ok": True, "n": 0, "ms": 50},
+            ]})
+        stats = usage.provider_stats(1)
+        assert stats["baidu"]["calls"] == stats["baidu"]["empty"] == 10, stats["baidu"]
+        assert stats["baidu"]["failure_rate"] == 0 and stats["keenable"]["failure_rate"] == 1, stats
+        assert stats["querit"]["ok_rate"] == 1 and stats["querit"]["empty"] == 10, stats["querit"]
+        assert "anysearch" not in stats
+        assert stats["volcengine"]["avg_ms"] > stats["querit"]["avg_ms"], stats
+        assert routing._adaptive_order(["baidu", "querit"], stats) == ["baidu", "querit"]
+        sparse_tail = {**stats, "volcengine": {**stats["volcengine"], "latency_samples": 1}}
+        assert routing._adaptive_order(ordered, sparse_tail) == ordered
+        # 其它来源同为 100% 命中，只有延迟不同。慢后端退后一位，而不是落到队尾。
+        result, _ = routing.order_escalation("普通查询")
+        assert result == ["querit", "volcengine", "tavily", "exa"], result
 
 
 @case("自适应路由不会跨区：国内问题仍然优先国内厂商")
@@ -2073,15 +2575,13 @@ def t_adaptive_no_cross_region():
     stats = {
         "tavily": {"calls": 50, "ok_rate": 1.0},        # 国际厂商，数据很好
         "baidu": {"calls": 50, "ok_rate": 0.2},         # 国内厂商，数据很差
+        "volcengine": {"calls": 50, "ok_rate": 0.9},
     }
-    saved = routing._load_stats
-    routing._load_stats = lambda: stats
-    try:
+    with patch.object(routing, "_load_stats", return_value=stats):
         ordered, decision = routing.order_escalation("中国最新的人工智能政策")
-    finally:
-        routing._load_stats = saved
+        assert routing._adaptive_order(["baidu", "tavily"], stats) == ["baidu", "tavily"]
     assert decision.region == "domestic"
-    assert ordered[:4] == ["volcengine", "querit", "yuanbao", "zhipu"] or ordered[0] in ("volcengine", "querit"), ordered
+    assert ordered[:3] == ["volcengine", "baidu", "querit"] and ordered.index("tavily") > ordered.index("bocha"), ordered
 
 
 @case("usage.provider_stats：只统计真的发出过请求的记录")
@@ -2100,70 +2600,150 @@ async def t_provider_stats():
 
 
 
-@case("热加载：改了 .env 不用重启就生效，且客户端 env 优先级不变")
+@case("热加载：子进程从已有 .env 启动，替换/删除生效，旧代理上的在途请求仍能完成")
 def t_reload_if_changed():
-    import os
-    import time
+    import json
+    import tempfile
 
-    from . import config
-    from .providers import POOLS
-
-    env_file = config.ACTIVE_ENV_FILE
-    original = env_file.read_text(encoding="utf-8") if env_file.exists() else ""
-    saved_keys = dict(config.API_KEYS)
-    try:
-        env_file.write_text("BOCHA_API_KEYS=hot-aaa111,hot-bbb222\n", encoding="utf-8")
-        time.sleep(0.02)
-        assert config.reload_if_changed() is True
-        assert config.API_KEYS["bocha"] == ["hot-aaa111", "hot-bbb222"], config.API_KEYS["bocha"]
-        assert POOLS["bocha"].keys == config.API_KEYS["bocha"], "key 池没有跟着刷新"
-        # 没有变化时不重复重载
-        assert config.reload_if_changed() is False
-
-        # 客户端传入的 key 优先级最高，重载后依然成立
-        config._CLIENT_ENV["EXA_API_KEY"] = "client-priority-key"
-        os.environ["EXA_API_KEY"] = "client-priority-key"
-        env_file.write_text("EXA_API_KEY=file-should-lose\nBOCHA_API_KEY=file-bocha\n", encoding="utf-8")
-        time.sleep(0.02)
-        config.reload_if_changed()
-        assert config.API_KEYS["exa"] == ["client-priority-key"], config.API_KEYS["exa"]
-
-        # 单行写错不崩溃，仍然完成重载
-        env_file.write_text("============ 分隔线\nBOCHA_API_KEY=still-works\n", encoding="utf-8")
-        time.sleep(0.02)
-        before = len(config.WARNINGS)
-        assert config.reload_if_changed() is True
-        assert config.API_KEYS["bocha"] == ["still-works"], config.API_KEYS["bocha"]
-        assert len(config.WARNINGS) > before, "写错的行应当产生告警"
-        # 告警里不能出现 key 的值
-        assert not any("still-works" in message for message in config.WARNINGS), config.WARNINGS
-    finally:
-        env_file.write_text(original, encoding="utf-8")
-        config._CLIENT_ENV.pop("EXA_API_KEY", None)
-        os.environ.pop("EXA_API_KEY", None)
-        for name, keys in saved_keys.items():
-            config.API_KEYS[name] = keys
-        time.sleep(0.02)
-        config.reload_if_changed()
+    with tempfile.TemporaryDirectory(prefix="reload-", dir=os.environ["AGGREGATE_SEARCH_HOME"]) as directory:
+        home = Path(directory)
+        _write_env(home / ".env", {
+            "TAVILY_API_KEYS": ",".join(_fake_key("tavily-old", i) for i in (1, 2)),
+            "PERPLEXITY_API_KEYS": _fake_key("perplexity-file"),
+            "JINA_API_KEY": _fake_key("jina"),
+            "DAILY_LIMITS": "jina:3",
+            "SEARCH_MODE": "auto",
+            "REGION_ROUTING": "domestic",
+            "ADAPTIVE_ROUTING": "false",
+            "FETCH_CACHE_TTL": "300",
+            "WEB_FETCH_PROVIDER": "jina",
+            "SEARCH_PROXY": "http://old-proxy.example:8080",
+            "PROXY_PROVIDERS": "tavily",
+        })
+        (home / "keys.json").write_text(json.dumps({"exa": [_fake_key("exa-old")],
+                                                   "perplexity": [_fake_key("perplexity-json")]}), encoding="utf-8")
+        _run_sandbox_child(home, _child_hot_reload, PPLX_API_KEY=_fake_key("perplexity-client"), JINA_API_KEY="")
 
 
-@case("refresh_pools：保留未删减 key 的轮转位置")
-def t_refresh_pools_keeps_cursor():
-    from .providers import POOLS, refresh_pools
+def _child_hot_reload() -> None:
+    import json
 
-    pool = POOLS.get("tavily")
-    assert pool is not None
-    pool.keys = ["k1-old", "k2-old", "k3-old"]
-    pool._cursor = 1                       # 下次该用 k2
-    refresh_pools({"tavily": ["k1-old", "k2-old", "k3-old", "k4-new"]})
-    assert POOLS["tavily"].keys == ["k1-old", "k2-old", "k3-old", "k4-new"]
-    assert pool._cursor == 2, pool._cursor  # 顺着 k2 往后走
-    # 当前 key 被删掉时，游标不越界
-    pool._cursor = 3
-    refresh_pools({"tavily": ["only-key"]})
-    assert pool.keys == ["only-key"] and 0 <= pool._cursor < 1, (pool.keys, pool._cursor)
-    refresh_pools({"tavily": []})
-    assert "tavily" not in POOLS, "配置里删掉的厂商，池子也应收起"
+    import httpx
+
+    from . import config, providers, routing, server, usage
+    from .keypool import _fingerprint
+
+    _install_fakes()
+    providers.REGISTRY["tavily"] = (REAL["tavily"][0], providers.REGISTRY["tavily"][1])
+
+    async def verify():
+        env_file, keys_file = config.ENV_FILE, config.KEYS_FILE
+        started, release = asyncio.Event(), asyncio.Event()
+        requests = []
+        clients = {}
+        old_proxy, new_proxy = "http://old-proxy.example:8080", "http://new-proxy.example:8080"
+        client_key = _fake_key("perplexity-client")
+        jina_key = _fake_key("jina")
+        old_keys = tuple(_fake_key("tavily-old", i) for i in (1, 2, 3))
+        new_key = _fake_key("tavily-new")
+
+        class MockProxyClient(httpx.AsyncClient):
+            def __init__(self, **kwargs):
+                proxy = kwargs.pop("proxy", None)
+
+                async def handler(request):
+                    query = json.loads(request.content)["query"]
+                    requests.append((query, proxy, request.headers.get("authorization")))
+                    if query == "旧代理在途":
+                        started.set()
+                        await release.wait()
+                        assert not self.is_closed, "旧代理连接在请求完成前已被关掉"
+                    return httpx.Response(200, json={"results": [{"url": "https://docs.example/notes",
+                                                                 "title": query, "content": "测试笔记"}]})
+
+                super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+                clients[proxy] = self
+
+        before = config.get_settings()
+        assert before.API_KEYS["tavily"] == old_keys[:2] and before.DAILY_LIMITS["jina"] == 3
+        assert before.API_KEYS["perplexity"] == (client_key,), before.API_KEYS["perplexity"]
+        assert before.API_KEYS["exa"] == (_fake_key("exa-old"),)
+        assert before.API_KEYS["jina"] == (jina_key,) and os.environ.get("JINA_API_KEY") == ""
+        assert "TAVILY_API_KEYS" not in os.environ, ".env 值不应写入客户端环境"
+        assert routing.detect_region("普通查询").region == "domestic"
+        assert not config.reload_if_changed()
+
+        target = "https://docs.example/cache"
+        await server.web_fetch(target)
+        assert "缓存命中" in await server.web_fetch(target) and FAKES.fetch_calls == [("jina", jina_key)]
+        assert usage.used("jina", _fingerprint(jina_key)) == (1, 1)
+
+        with patch.object(httpx, "AsyncClient", MockProxyClient):
+            await server.web_search("首次调用", providers=["tavily"])
+            assert requests[-1] == ("首次调用", old_proxy, "Bearer " + old_keys[0]), requests
+            original = config.parse_dotenv(env_file.read_text(encoding="utf-8"))
+            _write_env(env_file, {**original, "TAVILY_API_KEYS": ",".join(old_keys)})
+            draft = keys_file.with_suffix(".new")
+            draft.write_text(json.dumps({"exa": [_fake_key("exa-new")]}), encoding="utf-8")
+            draft.replace(keys_file)
+            await server.web_search("追加 key 后", providers=["tavily"])
+            assert requests[-1] == ("追加 key 后", old_proxy, "Bearer " + old_keys[1]), requests
+            assert config.get_settings().API_KEYS["exa"] == (_fake_key("exa-new"),)
+            assert config.get_settings().API_KEYS["perplexity"] == (client_key,)
+            assert config.get_settings().API_KEYS["tavily"] == old_keys and before.API_KEYS["tavily"] == old_keys[:2]
+
+            in_flight = asyncio.create_task(server.web_search("旧代理在途", providers=["tavily"]))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=5)
+                assert requests[-1] == ("旧代理在途", old_proxy, "Bearer " + old_keys[2]), requests
+                _write_env(env_file, {
+                    **original, "TAVILY_API_KEYS": new_key, "DAILY_LIMITS": "jina:1",
+                    "SEARCH_MODE": "free", "REGION_ROUTING": "global", "SEARCH_PROXY": new_proxy,
+                    "FETCH_CACHE_TTL": "0", "WEB_FETCH_PROVIDER": "keenable",
+                })
+                keys_file.unlink()
+                status = await server.web_status()
+                assert routing.detect_region("普通查询").region == "global"
+                assert any("默认" in line and "free" in line for line in status.splitlines()), status
+                assert not providers.has_keys("exa") and config.get_settings().API_KEYS["perplexity"] == (client_key,)
+                assert config.get_settings().API_KEYS["tavily"] == (new_key,)
+                assert config.get_settings().DAILY_LIMITS["jina"] == 1
+
+                # 同一额度已经使用一次。显式 all 可覆盖默认 free，但不能绕过收紧的上限。
+                _, errors, records = await providers.run_search(["jina"], "限额检查", 3)
+                assert not records[0].sent and "本地用量上限" in errors["jina"], (errors, records)
+                assert not FAKES.calls, FAKES.calls
+                await server.web_search("默认匿名模式")
+                assert {name for name, key in FAKES.calls if not key} == ANON_THREE and not _keyed(), FAKES.calls
+                FAKES.calls.clear()
+                all_reply = await server.web_search("新代理请求", search_mode="all")
+                assert "执行模式: **all**" in all_reply and "docs.example/notes" in all_reply, all_reply
+                assert requests[-1] == ("新代理请求", new_proxy, "Bearer " + new_key), requests
+                assert clients[old_proxy] is not clients[new_proxy] and not clients[old_proxy].is_closed
+                assert "jina" not in dict(FAKES.calls) and "exa" not in dict(FAKES.calls), FAKES.calls
+
+                for _ in range(2):
+                    uncached = await server.web_fetch(target)
+                    assert "抓取后端: keenable" in uncached and "缓存命中" not in uncached, uncached[:120]
+                assert FAKES.fetch_calls == [("jina", jina_key), ("keenable", ""), ("keenable", "")], FAKES.fetch_calls
+            finally:
+                release.set()
+                old_reply = await in_flight
+            assert "docs.example/notes" in old_reply and "旧代理在途" in old_reply, old_reply
+            assert clients[old_proxy].is_closed and not clients[new_proxy].is_closed
+
+            env_file.unlink()
+            await server.web_status()  # 真实工具入口自动刷新，不手动调用刷新函数。
+            settings = config.get_settings()
+            assert settings.SEARCH_MODE == "auto" and settings.REGION_ROUTING == "auto" and not settings.SEARCH_PROXY
+            assert settings.FETCH_CACHE_TTL > 0 and settings.DAILY_LIMITS["jina"] == 1  # 不因删文件而放宽额度
+            assert not providers.has_keys("tavily") and not providers.has_keys("jina")
+            assert settings.API_KEYS["perplexity"] == (client_key,)
+            assert os.environ.get("PPLX_API_KEY") == client_key and "TAVILY_API_KEYS" not in os.environ
+            assert not config.reload_if_changed(), "配置未变化时不应重复热加载"
+
+    asyncio.run(_run_case(verify()))
+
 
 # ---------------- 阶段三：SQLite 状态存储 ----------------
 
@@ -2207,39 +2787,122 @@ def t_legacy_json_migration():
     assert store.migrate_legacy() is False
 
 
-@case("SQLite 计数原子自增：多进程并发写也不会丢")
+@case("两个长驻 WAL 进程互见冷却和计数，只能有一个取得最后一次日/月额度")
 def t_sqlite_concurrent_counters():
     import subprocess
-    import sys as _sys
+    import tempfile
 
-    from . import store
+    with tempfile.TemporaryDirectory(prefix="wal-", dir=os.environ["AGGREGATE_SEARCH_HOME"]) as directory:
+        home = Path(directory)
+        _write_env(home / ".env", {
+            "EXA_API_KEY": _fake_key("exa"), "TAVILY_API_KEY": _fake_key("tavily"), "JINA_API_KEY": _fake_key("jina"),
+            "DAILY_LIMITS": "tavily:2", "MONTHLY_LIMITS": "jina:2",
+        })
+        children = []
+        try:
+            for role in ("a", "b"):
+                children.append(subprocess.Popen(
+                    _child_command(_child_sqlite_peer, role), cwd=home, env=_sandbox_env(home),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
+                ))
+            reports = [child.communicate(timeout=35) for child in children]
+            assert all(child.returncode == 0 for child in children), reports
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate()
 
-    store.reset_connection()
-    for suffix in ("", "-wal", "-shm"):
-        (store.DB_FILE.parent / (store.DB_FILE.name + suffix)).unlink(missing_ok=True)
-    store.reset_connection()
 
-    # 用两个独立进程各写 20 次，验证不会互相覆盖
-    import time as _time
-    today = _time.strftime("%Y-%m-%d")      # load_counters 只读当天/当月
-    code = (
-        "from aggregate_search import store;"
-        f"store.increment_counters([('day','{today}','demo','fp',1)] * 20);"
-        "print('ok')"
-    )
-    import os as _os
-    # 子进程必须用同一个沙盒配置目录，否则写的是另一个数据库
-    env = dict(_os.environ)
-    env["AGGREGATE_SEARCH_HOME"] = _os.environ["AGGREGATE_SEARCH_HOME"]
-    package_parent = str(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-    env["PYTHONPATH"] = package_parent + _os.pathsep + env.get("PYTHONPATH", "")
-    procs = [subprocess.run([_sys.executable, "-c", code], capture_output=True, text=True, env=env)
-             for _ in range(2)]
-    assert all(p.returncode == 0 for p in procs), [p.stderr[-300:] for p in procs]
-    # 父进程的连接是子进程写入之前打开的，WAL 下新数据可见，但要重开连接确认落盘
-    store.reset_connection()
-    rows = store.load_counters()
-    assert rows[("day", today, "demo", "fp")] == 40, rows
+def _child_sqlite_peer(role: str) -> None:
+    import time
+
+    from . import config, providers, store, usage
+    from .keypool import _fingerprint
+    from .providers.base import SearchResult
+
+    home = config.CONFIG_DIR
+    peer = "b" if role == "a" else "a"
+    conn = store._connect()
+    assert conn is not None and conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+
+    def mark(name: str) -> None:
+        (home / name).touch()
+
+    def wait_for(*names: str) -> None:
+        limit = time.monotonic() + 12
+        while not any((home / name).exists() for name in names):
+            assert time.monotonic() < limit, (role, names)
+            time.sleep(0.01)
+
+    key = _fake_key("exa")
+    fp = _fingerprint(key)
+    pool = providers.key_pool("exa")
+    # 双方都先读冷却和计数，且之后始终使用这个连接。写入仅进入 WAL，不靠关闭重开刷新。
+    assert pool.available() == 1 and usage.used("exa", fp) == (0, 0)
+    mark(f"ready-{role}")
+    wait_for(f"ready-{peer}")
+    if role == "a":
+        assert pool.next_key() == key
+        pool.release(key)
+        pool.record_failure(key, 429, "rate limit", retry_after=120)
+        mark("a-wrote")
+        wait_for("b-wrote")
+        assert pool.available() == 1 and usage.used("exa", fp) == (2, 2)
+    else:
+        wait_for("a-wrote")
+        assert store.DB_FILE.with_name(store.DB_FILE.name + "-wal").stat().st_size > 0
+        assert pool.available() == 0 and usage.used("exa", fp) == (1, 1)
+        usage.count_call("exa", fp)
+        store.delete_key_state("exa", fp)
+        mark("b-wrote")
+    assert store._connect() is conn
+
+    async def race():
+        for name, cap in (("tavily", "今日已用 2/2"), ("jina", "本月已用 2/2")):
+            key = _fake_key(name)
+            fp = _fingerprint(key)
+            if role == "a":
+                seed = providers.key_pool(name)
+                assert seed.next_key() == key
+                seed.release(key)
+                mark(f"seed-{name}")
+            wait_for(f"seed-{name}")
+            assert usage.used(name, fp) == (1, 1)
+
+            async def fake_search(client, supplied_key, query, maximum):
+                assert supplied_key == key
+                mark(f"sent-{name}-{role}")
+                # 让胜者保持在途，直到另一个进程真的分派或拒绝，验证预占而不是响应后计数。
+                wait_for(f"sent-{name}-{peer}", f"done-{name}-{peer}")
+                return [SearchResult(name, "https://docs.example/wal", "WAL 额度验证")]
+
+            mark(f"ready-{name}-{role}")
+            wait_for(f"ready-{name}-{peer}")
+            with patch.dict(providers.REGISTRY, {name: (fake_search, providers.REGISTRY[name][1])}):
+                _, errors, records = await providers.run_search([name], "剩余额度", 3)
+            mark(f"done-{name}-{role}")
+            wait_for(f"done-{name}-{peer}")
+            sent = [worker for worker in (role, peer) if (home / f"sent-{name}-{worker}").exists()]
+            assert len(sent) == 1 and records[0].sent == (role in sent), (name, sent, records)
+            if role in sent:
+                assert records[0].ok and records[0].used_key, records
+            else:
+                assert not records[0].used_key and cap in errors[name], errors
+            assert usage.used(name, fp) == (2, 2), (name, usage.used(name, fp))
+            assert store._connect() is conn
+
+    try:
+        asyncio.run(_run_case(race()))
+        # 再让双方各提交 20 次普通计数，也不能丢写。
+        for _ in range(20):
+            usage.count_call("simulated-counter", usage.ANON)
+        mark(f"minor-writes-{role}")
+        wait_for(f"minor-writes-{peer}")
+        assert usage.used("simulated-counter", usage.ANON) == (40, 40)
+    finally:
+        store.reset_connection()
 
 
 @case("WAL 模式已开启")
@@ -2254,24 +2917,71 @@ def t_sqlite_wal():
     assert timeout >= 5000, timeout
 
 
-@case("数据库不可用时不影响搜索（降级为无状态）")
+@case("SQLite 不可用时，匿名与不限额后端继续，受本地上限约束的 key 不发送")
 async def t_sqlite_unavailable():
     from . import config, providers, store
 
-    saved_db, saved_conn = store.DB_FILE, store._CONN
     store.reset_connection()
-    store.DB_FILE = config.CONFIG_DIR / "no-such-dir" / "x.db"   # 目录不存在 → 打开失败
     try:
-        # 读状态返回空、计数不报错、搜索照常跑
-        assert store.load_key_state() == {}
-        store.increment_counters([("day", "2026-01-01", "demo", "fp", 1)])
-        _, _, records = await providers.run_search(["keenable"], "数据库不可用时的问题", 3)
-        assert records and records[0].ok, records
+        with patch.object(store, "DB_FILE", config.CONFIG_DIR / "no-such-dir" / "x.db"):
+            assert store.load_key_state() == {}
+            store.increment_counters([("day", "2026-01-01", "demo", "fp", 1)])
+            _, errors, records = await providers.run_search(["keenable", "tavily", "jina"], "数据库不可用时的问题", 3)
+            assert records[0].ok and records[1].ok, records
+            assert not records[2].sent and "无法可靠记账" in errors["jina"], errors
+            assert {name for name, _ in FAKES.calls} == {"keenable", "tavily"}, FAKES.calls
     finally:
-        store.DB_FILE, store._CONN = saved_db, saved_conn
         store.reset_connection()
 
 # ---------------- 阶段三：HTTP 传输与鉴权守卫 ----------------
+
+@case("配置：坏 key 文件不阻挡收紧限额；错误或暂缺硬锁不自动解锁")
+def t_reload_preserves_policy():
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="reload-policy-", dir=os.environ["AGGREGATE_SEARCH_HOME"]) as directory:
+        home = Path(directory)
+        _write_env(home / ".env", {"DAILY_LIMITS": "tavily:3", "SEARCH_NO_ACCOUNT_KEYS": "true"})
+        (home / "keys.json").write_text('{"tavily": ["selftest-fake-original"]}', encoding="utf-8")
+        _run_sandbox_child(home, _child_reload_preserves_policy, SEARCH_NO_ACCOUNT_KEYS="   ")
+
+
+def _child_reload_preserves_policy() -> None:
+    from . import config, providers, server
+    from .providers.base import ProviderError
+
+    async def verify():
+        assert config.force_anonymous()
+        providers._note_anon_failure("keenable", ProviderError("正常限流响应", status=429))
+        assert providers.anon_cooling("keenable") > 0
+        config.KEYS_FILE.write_text("[", encoding="utf-8")
+        _write_env(config.ENV_FILE, {
+            "DAILY_LIMITS": "tavily:1", "SEARCH_NO_ACCOUNT_KEYS": "truu", "SEARCH_PROXY": "http://proxy.example:8080",
+        })
+        await server.web_status()
+        assert config.get_settings().DAILY_LIMITS["tavily"] == 1 and config.force_anonymous()
+        assert config.get_settings().API_KEYS["tavily"] == ("selftest-fake-original",)
+        assert providers.anon_cooling("keenable") == 0
+        config.ENV_FILE.write_text("DAILY_LIMITS\n# 暂未写完\n", encoding="utf-8")
+        await server.web_status()
+        assert config.get_settings().DAILY_LIMITS["tavily"] == 1 and config.force_anonymous()
+        _write_env(config.ENV_FILE, {"DAILY_LIMITS": "tavliy:9"})
+        await server.web_status()
+        assert config.get_settings().DAILY_LIMITS["tavily"] == 1 and config.force_anonymous()
+        config.ENV_FILE.write_text("", encoding="utf-8")
+        config.KEYS_FILE.write_text('{"tavily": ["selftest-fake-replaced"]}', encoding="utf-8")
+        await server.web_status()
+        assert config.get_settings().API_KEYS["tavily"] == ("selftest-fake-replaced",)
+        assert config.get_settings().DAILY_LIMITS["tavily"] == 1 and config.force_anonymous()
+        _write_env(config.ENV_FILE, {"DAILY_LIMITS": "tavily:0", "SEARCH_NO_ACCOUNT_KEYS": "false"})
+        config.KEYS_FILE.unlink()
+        await server.web_status()
+        assert config.get_settings().DAILY_LIMITS["tavily"] == 0 and not config.force_anonymous()
+        assert not config.get_settings().API_KEYS["tavily"]
+        config._CLIENT_ENV.pop("SEARCH_NO_ACCOUNT_KEYS", None)
+
+    asyncio.run(_run_case(verify()))
+
 
 @case("HTTP 守卫：非回环地址必须配足够长的 Token，否则拒绝启动")
 def t_http_guard():
@@ -2282,7 +2992,7 @@ def t_http_guard():
         assert server.is_loopback(host), host
         assert server.http_guard_error(host, "") == "", host
     # 非回环：没 Token 一定拒绝
-    for host in ("0.0.0.0", "192.168.1.10", "example.com", "::"):
+    for host in ("0.0.0.0", "192.168.1.10", "example.com", "127.example.test", "::"):
         problem = server.http_guard_error(host, "")
         assert "MCP_HTTP_TOKEN" in problem and "拒绝启动" in problem, (host, problem)
     # Token 太短也拒绝
@@ -2331,6 +3041,47 @@ async def t_bearer_guard():
     assert reached["app"] == 1
 
 
+@case("Streamable HTTP：非回环 Bearer、Origin 校验和 HTTP 应用生命周期离线可用")
+async def t_http_asgi():
+    import httpx
+    from mcp.server.fastmcp import FastMCP
+
+    from . import providers, server
+
+    token = _fake_key("http-bearer")
+    with patch.object(server, "mcp", FastMCP("selftest-http")), patch.object(server, "MCP_HTTP_TOKEN", token):
+        real_app_factory = server.mcp.streamable_http_app
+        created = []
+
+        def build_app():
+            application = real_app_factory()
+            created.append(application)
+            return application
+
+        # 调真实协议处理，但不打开本地监听器。
+        with patch.object(server.mcp, "streamable_http_app", side_effect=build_app):
+            app = server._http_app("0.0.0.0")
+        starlette_app, = created
+        shared_client = await providers.get_client("parallel")
+        async with starlette_app.router.lifespan_context(starlette_app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://search.example:8000") as client:
+                headers = {"Accept": "application/json, text/event-stream", "Authorization": "Bearer " + token}
+                init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-03-26", "capabilities": {},
+                    "clientInfo": {"name": "selftest", "version": "0"},
+                }}
+                assert (await client.post("/mcp", json=init, headers={"Accept": headers["Accept"]})).status_code == 401
+                offsite = await client.post("/mcp", json=init, headers={**headers, "Origin": "https://other.example"})
+                assert offsite.status_code == 403, offsite.text
+                response = await client.post("/mcp", json=init, headers=headers)
+                assert response.status_code == 200 and "serverInfo" in response.text, response.text
+                session_id = response.headers["mcp-session-id"]
+                ended = await client.delete("/mcp", headers={**headers, "Mcp-Session-Id": session_id})
+                assert ended.is_success, ended.text
+                assert not shared_client.is_closed
+        assert shared_client.is_closed
+
+
 @case("CLI：serve 支持 --transport / --host / --port")
 def t_cli_serve_options():
     from .cli import build_parser
@@ -2342,28 +3093,41 @@ def t_cli_serve_options():
     assert default.transport == "stdio" and default.host == "127.0.0.1" and default.port == 8000
 
 
-def run() -> int:
-    from . import config
+async def _run_case(outcome) -> None:
+    from . import providers
 
-    expected = SANDBOX_ENV["TAVILY_API_KEYS"].split(",")
-    if not os.environ.get("AGGREGATE_SEARCH_HOME") or config.API_KEYS.get("tavily") != expected:
+    try:
+        await outcome
+    finally:
+        await providers.close_clients()
+
+
+def run() -> int:
+    from . import config, store
+
+    expected = tuple(SANDBOX_ENV["TAVILY_API_KEYS"].split(","))
+    if not os.environ.get("AGGREGATE_SEARCH_HOME") or config.get_settings().API_KEYS.get("tavily") != expected:
         print("请运行 `aggregate-search selftest`：自测必须在它创建的临时沙盒里进行，以免动到你的真实配置。")
         return 2
 
     _install_fakes()
     failed = 0
-    for name, fn in CASES:
-        _reset()
-        try:
-            outcome = fn()
-            if asyncio.iscoroutine(outcome):
-                asyncio.run(outcome)
-        except Exception:
-            failed += 1
-            print(f"[失败] {name}")
-            traceback.print_exc(file=sys.stdout)
-        else:
-            print(f"[通过] {name}")
+    try:
+        for name, fn in CASES:
+            try:
+                _reset()
+                with _offline_http():
+                    outcome = fn()
+                    if asyncio.iscoroutine(outcome):
+                        asyncio.run(_run_case(outcome))
+            except Exception:
+                failed += 1
+                print(f"[失败] {name}")
+                traceback.print_exc(file=sys.stdout)
+            else:
+                print(f"[通过] {name}")
+    finally:
+        store.reset_connection()
     passed = len(CASES) - failed
     print(f"\n共 {len(CASES)} 项，通过 {passed} 项" + (f"，失败 {failed} 项" if failed else "，全部通过"))
     return 1 if failed else 0

@@ -17,6 +17,7 @@ from .base import (
     SearchResult,
     as_items,
     brief,
+    date_metadata,
     get_text,
     text_of,
     wants_time,
@@ -50,7 +51,9 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
             title=text_of(item.get("title")),
             snippet=text_of(item.get("description")),
             rank=i,
-            published=text_of(item.get("age")) or text_of(item.get("page_age")),
+            # Brave 的 age 可为展示用相对时间；page_age 为页龄，不等于发布日期。
+            published=text_of(item.get("publishedDate") or item.get("published_date")),
+            dates=date_metadata(page_age=item.get("page_age"), age=item.get("age")),
         )
         for i, item in enumerate(items)
     ]

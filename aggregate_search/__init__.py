@@ -4,4 +4,4 @@
 安装后用 `aggregate-search` 命令启动；配置放在 ~/.aggregate-search/。
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"

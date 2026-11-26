@@ -1,4 +1,4 @@
-"""聚合搜索 MCP Server（stdio 传输）。
+"""聚合搜索 MCP Server（stdio 或 Streamable HTTP 传输）。
 
 对外工具：
 - web_search: 匿名优先的多厂商聚合搜索，合并去重后返回带来源的证据
@@ -11,66 +11,44 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import re
 import sys
 import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from urllib.parse import urlsplit
+from datetime import datetime, timezone
+from html import escape
+from ipaddress import ip_address
+from urllib.parse import quote, urlsplit
 
+from anyio import fail_after
 from mcp.server.fastmcp import FastMCP
 
-from . import __version__, usage
+from . import __version__, config, usage
 from .config import (
-    ACTIVE_ENV_FILE,
-    ACTIVE_KEYS_FILE,
-    ANON_KEY_FALLBACK,
-    AUTO_ESCALATE_MAX,
     CONFIG_DIR,
-    DAILY_LIMITS,
-    DEFAULT_MAX_RESULTS,
     ENV_FILE,
-    ENV_IS_LEGACY,
-    ESCALATE_COUNT,
-    ESCALATE_EXCLUDE,
-    FETCH_CACHE_TTL,
-    FETCH_KEYED_FALLBACKS,
-    FETCH_MIN_CHARS,
-    FETCH_PREFERRED,
-    FREE_PROVIDERS,
-    KEYS_IS_LEGACY,
-    reload_if_changed,
-    MAX_RESULTS_CAP,
     MCP_HTTP_TOKEN,
-    MONTHLY_LIMITS,
-    NEAR_DEDUP,
-    PROXY_PROVIDERS,
-    SEARCH_MODE,
     SEARCH_MODES,
-    SEARCH_PROXY,
-    SEARCH_PROXY_ALL,
-    SEARCH_TIMEOUT,
-    TOTAL_RESULTS,
-    TOTAL_TIMEOUT,
-    UNVERIFIED_PROVIDERS,
-    USAGE_LOG,
     USAGE_LOG_FILE,
-    USE_SYSTEM_PROXY,
     WARNINGS,
     file_exists,
     log,
 )
 from .providers import (
     FETCH_PROVIDERS,
-    KEYLESS_ENABLED,
-    POOLS,
     REGISTRY,
     CallRecord,
     anon_cooling,
     auth_for,
     can_anonymous,
+    close_clients,
     enabled_search_providers,
     has_keys,
+    key_pool,
+    keyless_enabled,
     pool_status,
     provider_enabled,
     redact,
@@ -80,6 +58,7 @@ from .providers import (
 )
 from .providers.base import (
     ProviderError,
+    filter_results,
     fold_near_duplicates,
     merge_results,
     normalize_domains,
@@ -128,31 +107,33 @@ _FETCH_FREE = ("parallel", "keenable")
 _FETCH_KEYED = ("tavily", "jina", "firecrawl", "exa", "ollama", "parallel", "keenable")
 
 
-# web_fetch 的短期缓存：网址 -> (抓取结果, 时间戳)
-_FETCH_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+# web_fetch 的短期缓存：配置版本与通道 + 网址 -> (抓取结果, 时间戳)
+_FETCH_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
 _FETCH_CACHE_MAX = 64
 
 
-def _fetch_cache_get(url: str):
+def _fetch_cache_get(key: tuple):
     """取缓存（TTL 内有效）。返回 None 表示没有可用的缓存。"""
-    if FETCH_CACHE_TTL <= 0:
+    settings = config.get_settings()
+    if settings.FETCH_CACHE_TTL <= 0:
         return None
-    entry = _FETCH_CACHE.get(url)
+    entry = _FETCH_CACHE.get(key)
     if not entry:
         return None
     result, at = entry
-    if time.monotonic() - at > FETCH_CACHE_TTL:
-        _FETCH_CACHE.pop(url, None)
+    if time.monotonic() - at > settings.FETCH_CACHE_TTL:
+        _FETCH_CACHE.pop(key, None)
         return None
-    _FETCH_CACHE.move_to_end(url)
+    _FETCH_CACHE.move_to_end(key)
     return result
 
 
-def _fetch_cache_put(url: str, result) -> None:
-    if FETCH_CACHE_TTL <= 0:
+def _fetch_cache_put(key: tuple, result) -> None:
+    settings = config.get_settings()
+    if settings.FETCH_CACHE_TTL <= 0:
         return
-    _FETCH_CACHE[url] = (result, time.monotonic())
-    _FETCH_CACHE.move_to_end(url)
+    _FETCH_CACHE[key] = (result, time.monotonic())
+    _FETCH_CACHE.move_to_end(key)
     while len(_FETCH_CACHE) > _FETCH_CACHE_MAX:
         _FETCH_CACHE.popitem(last=False)
 
@@ -168,12 +149,13 @@ def _fetch_cache_clear() -> None:
 # ---------------------------------------------------------------------------
 _RECENT_TTL = 15 * 60
 _RECENT_MAX = 32
-_RECENT: OrderedDict[str, dict] = OrderedDict()
-# 问题 -> [锁, 正在使用或等待它的调用数]
-_SERIAL: dict[str, list] = {}
+_QueryKey = tuple[str, str, tuple[str, ...]]
+_RECENT: OrderedDict[tuple[int, bool, _QueryKey], dict] = OrderedDict()
+# 问题和过滤条件 -> [锁, 正在使用或等待它的调用数]
+_SERIAL: dict[_QueryKey, list] = {}
 
 
-def _query_key(query: str, time_range: str = "", domains=()) -> str:
+def _query_key(query: str, time_range: str = "", domains=()) -> _QueryKey:
     """缓存键：问题 + 过滤条件。
 
     必须带上过滤条件——否则先做一次不带过滤的搜索、再带时间或站点过滤 escalate，
@@ -181,25 +163,28 @@ def _query_key(query: str, time_range: str = "", domains=()) -> str:
     """
     base = " ".join(query.split()).casefold()
     normalized_time = normalize_time_range(time_range)
-    normalized_domains = tuple(sorted(normalize_domains(domains)))
-    if not normalized_time and not normalized_domains:
-        return base
-    return " | ".join([base, normalized_time, ",".join(normalized_domains)])
+    return base, normalized_time, normalize_domains(domains)
+
+
+def _recent_key(query: str, time_range: str, domains) -> tuple[int, bool, _QueryKey]:
+    settings = config.get_settings()
+    return settings.revision, config.force_anonymous(), _query_key(query, time_range, domains)
 
 
 def _channels(record: CallRecord) -> set[str]:
     """这次调用碰过哪些通道。匿名被限流后改用 key 的，两个通道都算试过。"""
-    return {record.auth, "anon"} if record.fallback else {record.auth}
+    return ({"anon"} if record.anon_sent else set()) | ({"key"} if record.used_key else set())
 
 
 def _mark_tried(tried: dict[str, set[str]], records: list[CallRecord]) -> None:
     for record in records:
-        tried.setdefault(record.provider, set()).update(_channels(record))
+        if channels := _channels(record):
+            tried.setdefault(record.provider, set()).update(channels)
 
 
 def _recall(query: str, time_range: str = "", domains=()) -> tuple[dict, dict[str, set[str]], float]:
     """取回同一问题（且过滤条件相同）还没过期的内容。"""
-    entry = _RECENT.get(_query_key(query, time_range, domains))
+    entry = _RECENT.get(_recent_key(query, time_range, domains))
     if not entry:
         return {}, {}, 0.0
     now = time.time()
@@ -223,7 +208,9 @@ def _remember(query: str, records: list[CallRecord], time_range: str = "", domai
     是合并而不是覆盖：同一个问题再跑一次 auto、或者点名查了某一家，
     都不会把「哪些厂商已经补过」忘掉，下一次 escalate 不会重复花同一批额度。
     """
-    key = _query_key(query, time_range, domains)
+    if config.get_settings().revision != config.get_live_settings().revision:
+        return  # 不让刷新前还在途的调用把旧凭据带回近期结果
+    key = _recent_key(query, time_range, domains)
     now = time.time()
     entry = _RECENT.setdefault(key, {"results": {}, "tried": {}})
     entry["results"] = {
@@ -237,11 +224,7 @@ def _remember(query: str, records: list[CallRecord], time_range: str = "", domai
     for record in records:
         # 只按实际发出的请求来记：没发出去的通道（key 冷却 / 到量、匿名通道冷却中）
         # 不算试过，过一会儿还可以再试
-        marks = {}
-        if record.anon_sent:
-            marks["anon"] = now
-        if record.keys_tried > 0:
-            marks["key"] = now
+        marks = {auth: now for auth in _channels(record)}
         if not marks:
             continue
         entry["tried"].setdefault(record.provider, {}).update(marks)
@@ -253,7 +236,7 @@ def _remember(query: str, records: list[CallRecord], time_range: str = "", domai
 
 
 @asynccontextmanager
-async def _serialized(query: str, time_range: str = "", domains=()):
+async def _serialized(query: str, time_range: str = "", domains=(), *, deadline: float | None = None):
     """同一个问题的 escalate 排队执行。
 
     两个并发的 escalate 如果同时读缓存，会挑中同一批厂商、把额度花两遍；
@@ -262,10 +245,24 @@ async def _serialized(query: str, time_range: str = "", domains=()):
     key = _query_key(query, time_range, domains)
     slot = _SERIAL.setdefault(key, [asyncio.Lock(), 0])
     slot[1] += 1
+    locked = False
     try:
-        async with slot[0]:
-            yield
+        if deadline is None:
+            await slot[0].acquire()
+            locked = True
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    with fail_after(remaining):
+                        await slot[0].acquire()
+                        locked = True
+                except TimeoutError:
+                    pass
+        yield locked
     finally:
+        if locked:
+            slot[0].release()
         slot[1] -= 1
         if not slot[1]:
             _SERIAL.pop(key, None)
@@ -279,9 +276,10 @@ def _escalation_order(query: str, region: str) -> tuple[list[str], RegionDecisio
     """完整的补搜顺序：按地域排好的名单在前；名单里没写但已经启用的厂商
     （配了 key 的、填了地址的自建 SearXNG 等）排在最后，不会被漏掉；
     再去掉明确排除的（ESCALATE_EXCLUDE）。"""
+    settings = config.get_settings()
     ordered, decision = order_escalation(query, region)
     ordered += [name for name in REGISTRY if name not in ordered and provider_enabled(name)]
-    return [name for name in ordered if name not in ESCALATE_EXCLUDE], decision
+    return [name for name in ordered if name not in settings.ESCALATE_EXCLUDE], decision
 
 
 def _escalation_plan(name: str, results: dict, tried: dict[str, set[str]]) -> str:
@@ -290,14 +288,15 @@ def _escalation_plan(name: str, results: dict, tried: dict[str, set[str]]) -> st
     返回 ''（不能）/ 'key'（带 key）/ 'anon'（匿名）/ 'anon+key'（先匿名，被限流再用 key）。
     已经有它的结果、已经试过的通道、冷却中或到了用量上限的 key，都不会再选。
     """
+    settings = config.get_settings()
     if name not in REGISTRY or REGISTRY[name][0] is None or name in results:
         return ""
     seen = tried.get(name, ())
-    key_ok = has_keys(name) and "key" not in seen and POOLS[name].usable() > 0
-    anon_ok = name in KEYLESS_ENABLED and "anon" not in seen and not anon_cooling(name)
-    if anon_ok and (name in FREE_PROVIDERS or not key_ok):
+    key_ok = not config.force_anonymous() and has_keys(name) and "key" not in seen and key_pool(name).usable() > 0
+    anon_ok = name in keyless_enabled() and "anon" not in seen and not anon_cooling(name)
+    if anon_ok and (name in settings.FREE_PROVIDERS or not key_ok):
         # 声明为匿名源的，哪怕配了 key 也先走匿名；别的厂商只有 key 用不了时才退回匿名
-        return "anon+key" if key_ok and ANON_KEY_FALLBACK else "anon"
+        return "anon+key" if key_ok and settings.ANON_KEY_FALLBACK else "anon"
     return "key" if key_ok else ""
 
 
@@ -323,6 +322,7 @@ async def _escalate(
     deadline: float,
     time_window: str = "",
     site_list: tuple[str, ...] = (),
+    as_of: datetime | None = None,
 ) -> tuple[list[str], RegionDecision, int, str]:
     """追加 target 个不同厂商，返回 (调用过的厂商, 地域判断, 拿到结果的家数, 提前停下的原因)。
 
@@ -353,13 +353,14 @@ async def _escalate(
             deadline=deadline,
             time_range=time_window,
             domains=site_list,
+            as_of=as_of,
         )
         results.update(got)
         records.extend(recs)
         _mark_tried(tried, recs)
         picked.extend(batch)
-        # 返回 0 条不算数：响应格式变了的厂商也会表现为空结果，得继续往后补
-        with_results += sum(1 for items in got.values() if items)
+        # 原始空或被条件筛光都不占补搜名额；已发出的通道仍然记账。
+        with_results += sum(bool(filter_results(items, time_window, site_list, as_of)) for items in got.values())
         if with_results >= target:
             break
         if all(record.network_failed for record in recs):
@@ -393,11 +394,12 @@ def _next_step(
 
     按缓存里的状态来预测，所以和紧接着调用 escalate 时实际会选的厂商一致。
     """
+    settings = config.get_settings()
     if mode == "free":
         return ""
     results, tried, _ = _recall(query, time_range, domains)
     upcoming, decision = _candidates(query, region, results, tried)
-    upcoming = upcoming[:ESCALATE_COUNT]
+    upcoming = upcoming[:settings.ESCALATE_COUNT]
     if not upcoming:
         if mode == "all":
             return ""
@@ -418,16 +420,6 @@ def _next_step(
     return text
 
 
-def _url_in_domains(url: str, domains) -> bool:
-    """url 的主机是否属于给定域名之一（含子域名）。"""
-    try:
-        host = urlsplit(url).hostname or ""
-    except ValueError:
-        return False
-    host = host.lower()
-    return any(host == domain or host.endswith("." + domain) for domain in domains)
-
-
 def _escape_tags(text: str) -> str:
     """转义外部文本里的尖括号，防止伪造 untrusted_content 标签逃逸。
 
@@ -444,8 +436,7 @@ def _escape_tags(text: str) -> str:
 
 def _escape_attr(value: str) -> str:
     """属性值里的尖括号和引号一律转义，否则可以伪造出额外属性或提前闭合标签。"""
-    text = (value or "").replace("<", "&lt;").replace(">", "&gt;")
-    return text.replace('"', "&quot;").replace("'", "&#39;")
+    return escape(" ".join(redact(value or "").split()), quote=True).replace("&#x27;", "&#39;")
 
 
 def _wrap_untrusted(text: str, source: str = "", url: str = "") -> str:
@@ -456,7 +447,35 @@ def _wrap_untrusted(text: str, source: str = "", url: str = "") -> str:
     if url:
         attrs.append(f'url="{_escape_attr(url)}"')
     opening = "<untrusted_content" + (" " + " ".join(attrs) if attrs else "") + ">"
-    return f"{opening}{_escape_tags(text or '')}</untrusted_content>"
+    return f"{opening}{_escape_tags(redact(text or ''))}</untrusted_content>"
+
+
+_MD_LABEL_CHARS = re.compile(r"([\\`*_[\]{}()#!|~])")
+
+
+def _markdown_label(text: str) -> str:
+    text = escape(" ".join(redact(text).split()), quote=False)
+    return _MD_LABEL_CHARS.sub(r"\\\1", text)
+
+
+def _markdown_link(label: str, url: str) -> str:
+    """把外部标题和目标渲染成单个链接；异常字符不能改写 Markdown 结构。"""
+    text = _markdown_label(label)
+    target = redact(url)
+    try:
+        parts = urlsplit(target)
+        if parts.scheme not in ("http", "https") or not parts.hostname or parts.username is not None:
+            return text
+    except ValueError:
+        return text
+    destination = quote(target, safe=":/?#[]@!$&'*+,;=%-._~", errors="replace")
+    return f"[{text}]({destination})"
+
+
+def _fetch_evidence(result) -> str:
+    title = f"# {_markdown_label(result.title)}\n\n" if result.title else ""
+    url = _markdown_link(result.url, result.url)
+    return _wrap_untrusted(f"{title}{url}\n\n{result.content}", result.provider, result.url)
 
 
 def _untrusted_notice() -> str:
@@ -475,26 +494,26 @@ def _format_search(
     notes: dict[str, str],
     carried: dict[str, int],
 ) -> str:
-    lines = [f"## 联网搜索统一汇总：{query}", "", headline]
-    consensus = [item for item in merged if item["source_count"] >= 2]
+    lines = [f"## 联网搜索统一汇总：{_markdown_label(query)}", "", headline, "", _untrusted_notice()]
+    consensus = [item for item in merged if item.get("consensus_source_count", item["source_count"]) >= 2]
     if consensus:
         lines.append("")
         lines.append("### 多源共识")
         for item in consensus[:5]:
-            lines.append(
-                f"- {_wrap_untrusted(item['title'] or item['url'], ', '.join(item['sources']), item['url'])}"
-                f"（{item['source_count']} 家：{', '.join(item['sources'])}）"
-            )
+            sources = ", ".join(item.get("consensus_sources", item["sources"]))
+            count = item.get("consensus_source_count", item["source_count"])
+            label = _markdown_label(item["title"] or item["url"])
+            url = item.get("consensus_url", item["url"])
+            lines.append(f"- {_wrap_untrusted(label, sources, url)}（{count} 家：{sources}）")
     lines.append("")
     lines.extend(["### 质量门禁与成本审计", *audit, ""])
-    lines.append(_untrusted_notice())
-    lines.append("")
     lines.append("### 去重后的证据列表")
     if not merged:
         lines.append("（没有返回任何结果）")
     for i, item in enumerate(merged, 1):
         title = item["title"] or item["url"]
-        lines.append(f"{i}. [{_escape_tags(title)}]({item['url']})")
+        link = _markdown_link(title, item["url"])
+        lines.append(f"{i}. {_wrap_untrusted(link, ', '.join(item['sources']), item['url'])}")
         # 按来源展示证据，折叠后的摘要仍能追溯到具体 URL。
         evidence = []
         seen_evidence = set()
@@ -504,21 +523,25 @@ def _format_search(
                 seen_evidence.add(key)
                 evidence.append(entry)
         for entry in evidence[:3]:
-            snippet = entry["snippet"]
+            snippet = redact(entry["snippet"])
             suffix = "…[摘要截断]" if len(snippet) > 500 else ""
-            date = f" ｜ {entry['published']}" if entry["published"] else ""
-            lines.append(
-                f"   - **{entry['source']}**{date}: "
-                + _wrap_untrusted(snippet[:500] + suffix, entry["source"], entry["url"])
-            )
+            date = entry["published"]
+            date_label = "发布"
+            if not date:
+                dates = entry.get("dates", {})
+                date = dates.get("source_date", "") or dates.get("page_age", "")
+                date_label = "来源时间"
+            body = (f"{date_label}: {_markdown_label(date)} ｜ " if date else "") + snippet[:500] + suffix
+            lines.append(f"   - **{entry['source']}**: " + _wrap_untrusted(body, entry["source"], entry["url"]))
             if entry["url"] != item["url"]:
-                lines.append(f"     证据 URL: {entry['url']}")
+                link = _markdown_link(entry["url"], entry["url"])
+                lines.append("     证据 URL: " + _wrap_untrusted(link, entry["source"], entry["url"]))
         if len(evidence) > 3:
             lines.append(f"   - 另有 {len(evidence) - 3} 条同源/转载证据因单页展示预算省略")
         meta = "来源: " + ", ".join(item["sources"])
         if item["published_dates"]:
             dates = item["published_dates"]
-            meta += " ｜ 发布: " + " / ".join(dates[:2])
+            meta += " ｜ 发布: " + _wrap_untrusted(_markdown_label(" / ".join(dates[:2])))
             if len(dates) > 2:
                 meta += f" 等 {len(dates)} 个日期"
         if item.get("alternate_urls"):
@@ -529,14 +552,14 @@ def _format_search(
         if item.get("alternate_urls"):
             lines.append(
                 "   转载链接: "
-                + "；".join(_wrap_untrusted(link, "", link) for link in item["alternate_urls"])
+                + "；".join(_wrap_untrusted(_markdown_link(link, link), url=link) for link in item["alternate_urls"])
             )
         lines.append("")
 
     lines.append("### 提供商状态")
     for record in records:
         if not record.sent:
-            lines.append(f"- {record.label}: 没有发出请求（{record.error}）")
+            lines.append(f"- {record.label}: 没有发出请求（{_wrap_untrusted(record.error, record.provider)}）")
             continue
         detail = f"{record.ms / 1000:.1f}s"
         if record.fallback:
@@ -544,17 +567,18 @@ def _format_search(
         if record.keys_tried > 1:
             detail += f"；试了 {record.keys_tried} 个 key"
         if record.ok:
-            lines.append(f"- {record.label}: OK（{record.count} 条，{detail}）")
+            filtered = record.filtered_count
+            counts = f"{record.count} 条" if filtered is None or filtered == record.count else f"原始 {record.count} 条，筛后 {filtered} 条"
+            lines.append(f"- {record.label}: OK（{counts}，{detail}）")
         else:
-            lines.append(f"- {record.label}: 失败（{record.error}；{detail}）")
+            lines.append(f"- {record.label}: 失败（{_wrap_untrusted(record.error, record.provider)}；{detail}）")
     lines.extend(f"- {name}: 沿用此前结果（{count} 条）" for name, count in carried.items())
     lines.extend(f"- {name}: 未调用（{msg}）" for name, msg in notes.items())
 
-    statuses = pool_status()
     pool_lines = [
-        f"- {name}: {statuses[name]}"
+        f"- {name}: {key_pool(name).status_line()}"
         for name in dict.fromkeys(r.provider for r in records if r.auth == "key")
-        if name in statuses
+        if has_keys(name)
     ]
     if pool_lines:
         lines.extend(["", "### key 状态", *pool_lines])
@@ -562,80 +586,27 @@ def _format_search(
 
 
 def _search_description() -> str:
-    free = ", ".join(name for name in FREE_PROVIDERS if name in REGISTRY) or "（未配置）"
-    auto_rule = (
-        f"本地门禁判断覆盖明显不足时，才自动追加 {AUTO_ESCALATE_MAX} 个不同厂商"
-        if AUTO_ESCALATE_MAX
-        else "不会自动补搜，要不要补由你决定"
-    )
-    has_fallback = ANON_KEY_FALLBACK and any(
-        has_keys(name) for name in FREE_PROVIDERS if can_anonymous(name)
-    )
-    anon_rule = (
-        "不带账号 key（某家匿名通道被限流时才改用它的 key，并会在结果里注明）"
-        if has_fallback
-        else "不发送任何账号 key"
-    )
-    # 说明要跟着本机的默认模式走：默认被改成 all / escalate 时，不能还写「默认不消耗额度」
-    default_note = {
-        "auto": "默认先做匿名搜索，简单问题不消耗账号额度。",
-        "free": "默认只做匿名搜索，不消耗账号额度。",
-        "escalate": (
-            "注意：本机把默认模式设成了 escalate，不传 search_mode 就会直接消耗账号额度；"
-            '想省额度请显式传 search_mode="auto"。'
-        ),
-        "all": (
-            "注意：本机把默认模式设成了 all，不传 search_mode 就会查询全部厂商、最费额度；"
-            '想省额度请显式传 search_mode="auto"。'
-        ),
-    }[SEARCH_MODE]
-    first = "先用默认的 auto" if SEARCH_MODE == "auto" else '先用 search_mode="auto"'
+    return f"""联网搜索：多厂商聚合、去重，返回带来源的证据。当前默认模式、厂商和补搜配置见 web_status。
 
-    def mark(mode: str) -> str:
-        return f"{mode}（默认）" if mode == SEARCH_MODE else mode
-
-    providers_rule = (
-        '本机默认是 free，点名的厂商也只做匿名调用（要带 key 请显式传 search_mode="auto"）'
-        if SEARCH_MODE == "free"
-        else '配了 key 的会带 key，只想匿名请同时传 search_mode="free"'
-    )
-
-    return f"""联网搜索：多厂商聚合、去重，返回带来源的证据。{default_note}
-
-推荐流程（省额度）：
-1. {first}：匿名查询 {free}，{anon_rule}；{auto_rule}。
-2. 阅读返回的证据，由你判断是否足以回答用户。
-3. 不够时，用同一个 query 再调一次并传 search_mode="escalate"：追加 {ESCALATE_COUNT} 个尚未查询的不同厂商，
-   与此前的结果合并去重后一起返回。可重复调用，每次换一批厂商。
-4. 仍不够才用 all。
-
-search_mode:
-- {mark("auto")}: 匿名优先，覆盖不足才限量补搜
-- {mark("free")}: 只做匿名调用，绝不发送账号 key
-- {mark("escalate")}: 跳过匿名阶段，直接补 {ESCALATE_COUNT} 个不同厂商（消耗这些厂商的额度）；不能和 providers 一起用
-- {mark("all")}: 查询全部已启用厂商（最费额度）
-
-region（可选）只决定补搜时先用哪几家，不过滤任何结果：
-- domestic: 中国大陆的政策、公司、产品、本地信息 → 优先国内搜索厂商
-- global: 海外信息、国际技术文档 → 优先国际搜索厂商
-- mixed: 中外对比，或两边都需要
-- 不传: 按问题里的地名、机构名自动判断
+推荐先用 auto：先走匿名，质量不足才限量补源。阅读证据后如还不足，同一个 query 传 escalate 补搜，最后再考虑 all。
+服务端禁止发送账号 key 时，任何搜索模式和点名参数都只能走匿名。
 
 Args:
     query: 搜索问题或关键词
-    max_results: 每个厂商取几条，默认 {DEFAULT_MAX_RESULTS}
-    providers: 只查指定厂商，如 ["tavily", "exa"]；{providers_rule}。可选 {', '.join(REGISTRY)}
-    total_results: 最终返回多少个页面，默认 {TOTAL_RESULTS}
-    search_mode: {' / '.join(SEARCH_MODES)}
-    region: domestic / global / mixed，不传则自动判断
-    time_range: 只要最近一段时间的结果：day / week / month / year（也认 24h、7d、本月 这类写法）；不传则不限制
-    domains: 只在这些站点里搜，如 ["docs.python.org", "github.com"]，最多 20 个
+    max_results: 每个厂商取几条
+    providers: 只查指定厂商；可选 {', '.join(REGISTRY)}。只想匿名请传 search_mode="free"
+    total_results: 最终返回多少个页面
+    search_mode: auto（匿名优先，覆盖不足补搜）/ free（只走匿名）/ escalate（只补搜，不能和 providers 一起用）/ all（查全部已启用厂商）
+    region: domestic / global / mixed，只影响补搜顺序，不限制结果
+    time_range: 最近 day / week / month / year（也认 24h、7d、本月 等）；未能核验发布时间的条目不返回
+    domains: 只保留这些站点及其子域名的结果，如 ["docs.python.org", "github.com"]，最多 20 个
 
-提示：带筛选条件再来 escalate 时，请把同样的 time_range / domains 一起传，否则不会沿用上一次的筛选结果。
+提示：带筛选条件再来 escalate 时，请传相同的 time_range / domains，才能沿用此前结果。
 """
 
 
 @mcp.tool(description=_search_description())
+@config.with_runtime_settings
 async def web_search(
     query: str,
     max_results: int | None = None,
@@ -647,12 +618,12 @@ async def web_search(
     domains: list[str] | None = None,
 ) -> str:
     """联网搜索、质量门禁、去重和统一证据汇总。给模型看的说明见 _search_description()。"""
-    reload_if_changed()   # 改了 .env / keys.json 不用重启，下一次调用就生效
+    settings = config.get_settings()
     started = time.monotonic()  # 总时限从这里算起：排队等同一问题的上一次 escalate 也算在内
     query = (query or "").strip()
     if not query:
         return "query 不能为空"
-    mode = (search_mode or SEARCH_MODE).strip().lower()
+    mode = (search_mode or settings.SEARCH_MODE).strip().lower()
     if mode not in SEARCH_MODES:
         return f"search_mode 仅支持 {' / '.join(SEARCH_MODES)}"
     region_choice = normalize_region(region)
@@ -666,11 +637,13 @@ async def web_search(
             f"收到: {raw_time[:40]}"
         )
     site_list = normalize_domains(domains)
+    if domains and not site_list:
+        return "domains 里没有有效站点，请传主机名，例如 docs.python.org。"
     per_provider = min(
-        max_results if max_results and max_results > 0 else DEFAULT_MAX_RESULTS,
-        MAX_RESULTS_CAP,
+        max_results if max_results and max_results > 0 else settings.DEFAULT_MAX_RESULTS,
+        settings.MAX_RESULTS_CAP,
     )
-    limit = total_results if total_results and total_results > 0 else TOTAL_RESULTS
+    limit = total_results if total_results and total_results > 0 else settings.TOTAL_RESULTS
     # 去重且保序：["tavily","tavily"] 不该并发打两次、白耗两份额度
     requested = list(dict.fromkeys(
         p.strip().lower() for p in (providers or []) if isinstance(p, str) and p.strip()
@@ -684,15 +657,14 @@ async def web_search(
                 'search_mode="escalate" 不能和 providers 一起用：escalate 会自己挑还没查过的厂商。'
                 "去掉 providers 再调一次即可。"
             )
-        async with _serialized(query):
-            return await _search(
-                query, mode, region_choice, requested, per_provider, limit, started,
-                time_window, site_list,
-            )
-    return await _search(
-                query, mode, region_choice, requested, per_provider, limit, started,
-                time_window, site_list,
-            )
+        async with _serialized(query, time_window, site_list, deadline=started + settings.TOTAL_TIMEOUT) as locked:
+            if not locked:
+                return (
+                    f"排队等同一问题的上一次补搜用掉了总时限（{settings.TOTAL_TIMEOUT:g} 秒），这次没有发出任何请求。"
+                    "请再调用一次。"
+                )
+            return await _search(query, mode, region_choice, requested, per_provider, limit, started, time_window, site_list)
+    return await _search(query, mode, region_choice, requested, per_provider, limit, started, time_window, site_list)
 
 
 async def _search(
@@ -706,7 +678,9 @@ async def _search(
     time_window: str = "",
     site_list: tuple[str, ...] = (),
 ) -> str:
-    deadline = started + TOTAL_TIMEOUT
+    settings = config.get_settings()
+    deadline = started + settings.TOTAL_TIMEOUT
+    as_of = datetime.now(timezone.utc)
     results: dict = {}
     records: list[CallRecord] = []
     tried: dict[str, set[str]] = {}
@@ -719,19 +693,20 @@ async def _search(
     plan: list[str] = []
     anonymous: set[str] = set()
     stage = ""
+    free_only = mode == "free" or config.force_anonymous()
     if requested:
-        stage = "指定厂商（匿名）" if mode == "free" else "指定厂商"
+        stage = "指定厂商（匿名）" if free_only else "指定厂商"
         for name in requested:
             if name not in REGISTRY:
                 notes[name] = f"未知厂商，可选: {', '.join(REGISTRY)}"
-            elif mode == "free":
+            elif free_only:
                 # free 的承诺是“不发送账号 key”，不是“配了 key 的厂商不能用”：
                 # 能匿名调用的照常查，只是不带 key。
                 if can_anonymous(name):
                     plan.append(name)
                     anonymous.add(name)
                 else:
-                    notes[name] = "free 模式只做匿名调用，这家必须带 key 才能用"
+                    notes[name] = "只做匿名调用，这家必须带 key 才能用"
             elif provider_enabled(name, explicit=True):
                 plan.append(name)
             else:
@@ -739,7 +714,7 @@ async def _search(
                 notes[name] = f"未配置（需要 {hint}）"
     elif mode in ("auto", "free"):
         stage = "匿名免费"
-        for name in FREE_PROVIDERS:
+        for name in settings.FREE_PROVIDERS:
             if name not in REGISTRY:
                 continue
             if can_anonymous(name):
@@ -755,7 +730,8 @@ async def _search(
     def nothing_available() -> str:
         configured = ", ".join(enabled_search_providers()) or "无"
         detail = "；".join(f"{name}: {msg}" for name, msg in notes.items()) or "无"
-        return f"没有可用的搜索提供商（已启用: {configured}）。原因: {detail}"
+        policy = "服务端已禁止发送账号 key（SEARCH_NO_ACCOUNT_KEYS）。" if config.force_anonymous() else ""
+        return f"{policy}没有可用的搜索提供商（已启用: {configured}）。原因: {detail}"
 
     # auto 且没点名时，第一阶段没有可查的厂商（比如 FREE_PROVIDERS 配错了）不算失败，继续走补搜
     if not plan and (requested or mode in ("free", "all")):
@@ -763,9 +739,9 @@ async def _search(
 
     if plan:
         # auto：匿名通道被限流、而这家又配了 key 时，允许改用 key；free 和点名指定时不允许。
-        fallback = anonymous if mode == "auto" and not requested and ANON_KEY_FALLBACK else ()
+        fallback = anonymous if mode == "auto" and not free_only and not requested and settings.ANON_KEY_FALLBACK else ()
         got, _, recs = await run_search(
-            plan, query, per_provider, anonymous, fallback, deadline, time_window, site_list,
+            plan, query, per_provider, anonymous, fallback, deadline, time_window, site_list, as_of,
         )
         results.update(got)
         records.extend(recs)
@@ -773,9 +749,11 @@ async def _search(
         phases.append((stage, list(plan)))
 
     def assess():
-        items = merge_results(results)
+        eligible = {name: filter_results(items, time_window, site_list, as_of) for name, items in results.items()}
+        unique = merge_results(eligible)
+        delivered, folded = fold_near_duplicates(unique) if settings.NEAR_DEDUP else (unique, 0)
         failures = {r.provider: r.error for r in records if not r.ok and r.provider not in results}
-        return items, assess_quality(query, items, failures)
+        return eligible, len(unique), delivered, folded, assess_quality(query, delivered, failures)
 
     # ---- 第二阶段：补搜 ----
     target = 0
@@ -785,11 +763,11 @@ async def _search(
         carried = {name: len(items) for name, items in prior.items()}
         for name, auths in prior_tried.items():
             tried.setdefault(name, set()).update(auths)
-        target = ESCALATE_COUNT
-    elif mode == "auto" and not requested and AUTO_ESCALATE_MAX > 0:
-        _, first_pass = assess()
+        target = settings.ESCALATE_COUNT
+    elif mode == "auto" and not requested and settings.AUTO_ESCALATE_MAX > 0:
+        *_, first_pass = assess()
         if not first_pass.sufficient:
-            target = AUTO_ESCALATE_MAX
+            target = settings.AUTO_ESCALATE_MAX
 
     escalated: list[str] = []
     decision: RegionDecision | None = None
@@ -798,7 +776,7 @@ async def _search(
     if target:
         escalated, decision, with_results, stopped = await _escalate(
             query, per_provider, region_choice, target, results, records, tried, deadline,
-            time_window, site_list,
+            time_window, site_list, as_of,
         )
         if escalated:
             phases.append(("补搜", escalated))
@@ -806,7 +784,7 @@ async def _search(
     if not records and not results:
         if stopped == "time":
             return (
-                f"排队等同一问题的上一次补搜用掉了总时限（{TOTAL_TIMEOUT:g} 秒），这次没有发出任何请求。"
+                f"排队等同一问题的上一次补搜用掉了总时限（{settings.TOTAL_TIMEOUT:g} 秒），这次没有发出任何请求。"
                 "请再调用一次。"
             )
         if mode == "escalate":
@@ -817,32 +795,29 @@ async def _search(
         return nothing_available()
 
     # ---- 汇总 ----
-    unique_items, quality = assess()
-    if site_list:
-        # 上游可能忽略站点参数，这里再按域名过滤一遍（子域名也算命中）
-        unique_items = [
-            item for item in unique_items if _url_in_domains(item["url"], site_list)
-        ]
-    delivered_items, folded = (
-        fold_near_duplicates(unique_items) if NEAR_DEDUP else (unique_items, 0)
-    )
+    eligible, unique, delivered_items, folded, quality = assess()
     merged = delivered_items[:limit]
     omitted = max(0, len(delivered_items) - len(merged))
 
     called = list(dict.fromkeys(r.provider for r in records if r.sent))
-    with_hits = [name for name in called if results.get(name)]
+    with_hits = [name for name in called if eligible.get(name)]
     empty = [name for name in called if name in results and not results[name]]
+    filtered = [name for name in called if results.get(name) and not eligible.get(name)]
+    for record in records:
+        if record.ok:
+            record.filtered_count = len(eligible.get(record.provider, ()))
     failed = [name for name in called if name not in results]
     raw = sum(len(items) for items in results.values())
     headline = (
         f"本次查询 **{len(called)} 家**，有效返回 **{len(with_hits)} 家**"
         + (f"，空结果 **{len(empty)} 家**" if empty else "")
+        + (f"，被筛光 **{len(filtered)} 家**" if filtered else "")
         + (f"，失败 **{len(failed)} 家**" if failed else "")
         + (
             f"；并入 {max(1, round(carried_age / 60))} 分钟内同一问题的 **{len(carried)} 家**结果"
             if carried else ""
         )
-        + f"；原始命中 **{raw} 条**，同 URL 归并后 **{len(unique_items)} 个页面**"
+        + f"；原始命中 **{raw} 条**，筛选、同 URL 归并后 **{unique} 个页面**"
         + (f"，近似重复折叠 **{folded} 条**" if folded else "")
         + f"，以下交付 **{len(merged)} 个页面**"
         + (f"；另有 **{omitted} 个页面**因 total_results 上限未展示" if omitted else "")
@@ -850,6 +825,8 @@ async def _search(
     )
 
     audit = [quality.as_markdown()]
+    if config.force_anonymous():
+        audit.append("- 服务端已禁止发送账号 key（SEARCH_NO_ACCOUNT_KEYS）。")
     if phases:
         audit.append(
             f"- 执行模式: **{mode}**；阶段: "
@@ -862,15 +839,15 @@ async def _search(
     if time_window or site_list:
         parts = []
         if time_window:
-            parts.append(f"时间范围={time_window}")
+            parts.append(f"时间范围={time_window}（仅保留可核验发布时间的结果）")
         if site_list:
             parts.append("站点=" + ", ".join(site_list[:5]) + (" 等" if len(site_list) > 5 else ""))
         audit.append("- 筛选条件: " + "；".join(parts))
     if target and with_results < target:
         why = {
-            "time": f"已到总时限 {TOTAL_TIMEOUT:g} 秒，没有继续递补",
+            "time": f"已到总时限 {settings.TOTAL_TIMEOUT:g} 秒，没有继续递补",
             "network": "这一轮全部是网络错误，没有继续递补",
-        }.get(stopped, "其余厂商没配 key、在冷却中、已到本地用量上限、调用失败或没有搜到结果")
+        }.get(stopped, "其余厂商没配 key、在冷却中、已到本地用量上限、调用失败、没有搜到结果或不符合筛选条件")
         audit.append(f"- 补搜数量: 目标 {target} 家，实际拿到结果 {with_results} 家（{why}）。")
     if mode == "escalate" and not carried:
         audit.append("- 说明: 没有找到同一问题的近期结果，本次只包含补搜厂商的结果。")
@@ -890,7 +867,8 @@ async def _search(
         "calls": [record.as_log() for record in records],
         "escalated": escalated,
         "gate": "pass" if quality.sufficient else "fail",
-        "unique": len(unique_items),
+        "unique": unique,
+        "filtered": sum(len(items) for items in eligible.values()),
         "delivered": len(merged),
         "elapsed_ms": int((time.monotonic() - started) * 1000),
     })
@@ -911,7 +889,8 @@ def fetch_chain(include_unavailable: bool = False) -> list[tuple[str, bool]]:
     默认模式设成 free 时只保留匿名后端：free 的承诺是「不发送账号 key」，抓取也得守住。
     include_unavailable=True 时不排除正在冷却 / 已到用量上限的 key（给工具说明用）。
     """
-    free_only = SEARCH_MODE == "free"
+    settings = config.get_settings()
+    free_only = config.force_anonymous() or settings.SEARCH_MODE == "free"
     chain: list[tuple[str, bool]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -925,14 +904,14 @@ def fetch_chain(include_unavailable: bool = False) -> list[tuple[str, bool]]:
             seen.add(mark)
             chain.append((name, anonymous))
 
-    for name in FETCH_PREFERRED:
+    for name in settings.FETCH_PREFERRED:
         if provider_enabled(name, explicit=True):
             add(name, free_only)  # free 时首选也只走匿名；不能匿名的会被 add() 丢掉
     for name in _FETCH_FREE:
         add(name, True)
     if not free_only:
         for name in _FETCH_KEYED:
-            if has_keys(name) and (include_unavailable or POOLS[name].usable() > 0):
+            if has_keys(name) and (include_unavailable or key_pool(name).usable() > 0):
                 add(name, False)
     return chain
 
@@ -942,32 +921,19 @@ def _fetch_label(name: str, anonymous: bool) -> str:
 
 
 def _fetch_description() -> str:
-    order = " → ".join(
-        _fetch_label(name, anon) for name, anon in fetch_chain(include_unavailable=True)
-    ) or "（没有可用后端）"
-    if SEARCH_MODE == "free":
-        keyed_rule = "本机默认模式是 free，抓取只走匿名后端，不发送账号 key"
-    elif FETCH_KEYED_FALLBACKS:
-        keyed_rule = f"免费后端都抓不到时，最多再试 {FETCH_KEYED_FALLBACKS} 个带 key 的后端"
-    else:
-        keyed_rule = "不会自动换到其它带 key 的后端"
-    provider_rule = (
-        "只能指定可匿名使用的后端，不带 key" if SEARCH_MODE == "free" else "配了它的 key 就会带 key"
-    )
     return f"""抓取网页正文，返回 Markdown / 纯文本。
 
-不指定后端时按这个顺序尝试，抓到正文即停：{order}。
-某个后端失败会自动换下一个；{keyed_rule}。正文过短（疑似反爬页或空壳）时会再换一个后端复核。
-可选后端: {', '.join(FETCH_PROVIDERS)}。
+未指定后端时按配置依次尝试，优先走匿名；某个后端失败或正文过短时会按策略复核。当前顺序及账号策略见 web_status。
+服务端禁止发送账号 key 时，指定后端也只能用匿名通道。
 
 Args:
     url: 要抓取的网页地址（http / https）
-    provider: 可选，只用指定的后端（{provider_rule}）
+    provider: 可选，只用指定后端；可选 {', '.join(FETCH_PROVIDERS)}
 """
 
 
 def _loggable_url(url: str) -> str:
-    """写进使用记录的网址：去掉账号口令和 ? 后面的参数——预签名链接、token 之类不该落盘。"""
+    """供状态或使用记录展示：去掉账号口令和具体查询参数。"""
     try:
         parts = urlsplit(url)
         host = parts.hostname or ""
@@ -980,44 +946,39 @@ def _loggable_url(url: str) -> str:
 
 
 @mcp.tool(description=_fetch_description())
+@config.with_runtime_settings
 async def web_fetch(url: str, provider: str | None = None) -> str:
     """抓取网页正文。给模型看的说明见 _fetch_description()。"""
-    reload_if_changed()
+    settings = config.get_settings()
     started = time.monotonic()
-    deadline = started + TOTAL_TIMEOUT
+    deadline = started + settings.TOTAL_TIMEOUT
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
-        return f"只支持 http/https 链接，收到: {url[:120]}"
+        return "只支持合法的 http/https 链接。"
 
-    # 显式指定后端时只试这一家；未指定时按顺序回退，某家挂了不至于抓不到正文。
+    # 显式指定后端时只试这一家；先确定账号策略，再尝试缓存。
     explicit = (provider or "").strip().lower()
-    cache_key = f"{explicit}|{url}"
-    cached = _fetch_cache_get(cache_key)
-    if cached is not None:
-        # 命中缓存：不花额度、不占时间，但内容照样按外部数据包裹
-        nl = chr(10)
-        prefix = (
-            "抓取后端: " + cached.provider
-            + f"（缓存命中，{FETCH_CACHE_TTL} 秒内有效）" + nl + nl
+    if explicit and explicit not in FETCH_PROVIDERS:
+        return f"指定的抓取后端不可用，可选: {', '.join(FETCH_PROVIDERS)}"
+    free_only = config.force_anonymous() or settings.SEARCH_MODE == "free"
+    if explicit and free_only and not can_anonymous(explicit):
+        anonymous_backends = [name for name in FETCH_PROVIDERS if can_anonymous(name)]
+        return (
+            f"当前配置只做匿名调用，而 {explicit} 必须带 key 才能抓取。"
+            f"可匿名使用的后端: {', '.join(anonymous_backends)}"
         )
-        title = _escape_tags(cached.title)
-        header = (("# " + title + nl + nl + cached.url + nl + nl)
-                  if title else (cached.url + nl + nl))
-        body = _wrap_untrusted(cached.content, cached.provider, cached.url)
-        return prefix + _untrusted_notice() + nl + nl + header + body
+    chain = [(explicit, free_only)] if explicit else fetch_chain()
+    cache_key = (config.get_settings().revision, free_only, explicit, url)
+    cached = _fetch_cache_get(cache_key)
+    if cached is not None and (not free_only or cached.auth == "anon"):
+        usage.log_event({
+            "tool": "web_fetch", "url": _loggable_url(url), "backend": cached.provider,
+            "auth": cached.auth, "chars": len(cached.content), "cache_hit": True, "attempts": [],
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        })
+        prefix = f"抓取后端: {cached.provider}（缓存命中，{settings.FETCH_CACHE_TTL} 秒内有效）\n\n"
+        return prefix + _untrusted_notice() + "\n\n" + _fetch_evidence(cached)
 
-    if not explicit:
-        chain = fetch_chain()
-    elif SEARCH_MODE == "free":
-        if explicit in FETCH_PROVIDERS and not can_anonymous(explicit):
-            anonymous_backends = [name for name in FETCH_PROVIDERS if can_anonymous(name)]
-            return (
-                f"本机默认模式是 free（只做匿名调用），而 {explicit} 必须带 key 才能抓取。"
-                f"可匿名使用的后端: {', '.join(anonymous_backends)}"
-            )
-        chain = [(explicit, True)]
-    else:
-        chain = [(explicit, False)]
     failures: list[str] = []
     attempts: list[dict] = []
     best = None
@@ -1033,8 +994,8 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
         label = _fetch_label(name, anonymous)
         keyed = auth_for(name, anonymous) == "key"
         # 用户用 WEB_FETCH_PROVIDER 点名的首选后端不受上限约束
-        capped = keyed and not explicit and name not in FETCH_PREFERRED
-        if capped and keyed_failures >= FETCH_KEYED_FALLBACKS:
+        capped = keyed and not explicit and name not in settings.FETCH_PREFERRED
+        if capped and keyed_failures >= settings.FETCH_KEYED_FALLBACKS:
             # 免费后端和几家带 key 的都抓不到，多半是地址本身有问题，不再继续消耗额度
             skipped.append(label)
             continue
@@ -1052,7 +1013,7 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
             )
             message = ""
         except asyncio.TimeoutError:
-            message = f"超过总时限 {TOTAL_TIMEOUT:g} 秒，已放弃"
+            message = f"超过总时限 {settings.TOTAL_TIMEOUT:g} 秒，已放弃"
             out_of_time = True
         except ProviderError as exc:
             message = redact(str(exc))
@@ -1068,7 +1029,7 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
         if result is None:
             if capped and sent:
                 keyed_failures += 1
-            failures.append(f"{label}: {message}")
+            failures.append(f"{label}: {_wrap_untrusted(message, name)}")
             entry = {
                 "p": name, "auth": auth_for(name, anonymous), "ok": False,
                 # 后端的报错里常常带着被抓的网址（可能已被截断或脱敏过），落盘前去掉所有网址的参数
@@ -1085,7 +1046,7 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
         attempts.append({"p": name, "auth": result.auth, "ok": True, "ms": cost, "chars": size})
         if best is None or size > len(best.content):
             best = result
-        if explicit or size >= FETCH_MIN_CHARS:
+        if explicit or size >= settings.FETCH_MIN_CHARS:
             break
         # 正文过短：可能是反爬页、登录墙或空壳。换一家比一比。
         short = short or label
@@ -1096,6 +1057,7 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
         "backend": best.provider if best else "",
         "auth": best.auth if best else "",
         "chars": len(best.content) if best else 0,
+        "cache_hit": False,
         "attempts": attempts,
         "elapsed_ms": int((time.monotonic() - started) * 1000),
     })
@@ -1109,14 +1071,14 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
                 "确认地址无误后，可用 provider 参数指定其中一家再试。"
             )
         if out_of_time:
-            text += f"\n\n已到总时限 {TOTAL_TIMEOUT:g} 秒，没有继续尝试剩下的后端。"
+            text += f"\n\n已到总时限 {settings.TOTAL_TIMEOUT:g} 秒，没有继续尝试剩下的后端。"
         return text
 
     prefix = f"抓取后端: {best.provider}（{'账号 key' if best.auth == 'key' else '匿名'}）\n\n"
     if failures:
         prefix += "已跳过失败后端: " + "；".join(failures) + "\n\n"
     if short:
-        if len(best.content) >= FETCH_MIN_CHARS:
+        if len(best.content) >= settings.FETCH_MIN_CHARS:
             prefix += f"提示: {short} 返回的正文过短，已换后端重抓。\n\n"
         elif successes > 1:
             prefix += (
@@ -1128,15 +1090,8 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
                 f"提示: 正文只有 {len(best.content)} 字符，且没能用别的后端复核成功——"
                 "页面可能本身很短，也可能需要登录或有反爬。可用 provider 参数指定后端再试。\n\n"
             )
-    header = (
-        f"# {_escape_tags(best.title)}\n\n{best.url}\n\n"
-        if best.title
-        else f"{best.url}\n\n"
-    )
-    if best.content:
-        _fetch_cache_put(cache_key, best)
-    body = _wrap_untrusted(best.content or "", best.provider, best.url) if best.content else "（正文为空）"
-    return prefix + _untrusted_notice() + "\n\n" + header + body
+    _fetch_cache_put(cache_key, best)
+    return prefix + _untrusted_notice() + "\n\n" + _fetch_evidence(best)
 
 
 # ---------------------------------------------------------------------------
@@ -1144,12 +1099,14 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 def _limits_text() -> str:
-    parts = [f"{name} 每日 {count} 次/key" for name, count in DAILY_LIMITS.items() if count]
-    parts += [f"{name} 每月 {count} 次/key" for name, count in MONTHLY_LIMITS.items() if count]
+    settings = config.get_settings()
+    parts = [f"{name} 每日 {count} 次/key" for name, count in settings.DAILY_LIMITS.items() if count]
+    parts += [f"{name} 每月 {count} 次/key" for name, count in settings.MONTHLY_LIMITS.items() if count]
     return "；".join(parts) or "未设置"
 
 
 def status_text(usage_days: int | None = 0) -> str:
+    settings = config.get_settings()
     lines = [f"## 聚合搜索状态（v{__version__}）", ""]
     if WARNINGS:
         lines.append("### 配置里有问题（已自动跳过，建议修正）")
@@ -1158,35 +1115,36 @@ def status_text(usage_days: int | None = 0) -> str:
 
     lines.append("### 配置位置")
     lines.append(f"- 配置目录: {CONFIG_DIR}")
-    if ENV_IS_LEGACY:
+    (env_file, env_legacy), (keys_file, keys_legacy) = config.active_files()
+    if env_legacy:
         lines.append(
-            f"- 配置文件: {ACTIVE_ENV_FILE}（旧位置。运行 `aggregate-search init` 可迁移到 {ENV_FILE}）"
+            f"- 配置文件: {env_file}（旧位置。运行 `aggregate-search init` 可迁移到 {ENV_FILE}）"
         )
-    elif file_exists(ENV_FILE):
-        lines.append(f"- 配置文件: {ENV_FILE}")
+    elif file_exists(env_file):
+        lines.append(f"- 配置文件: {env_file}")
     else:
         lines.append(f"- 配置文件: 还没有。运行 `aggregate-search init` 会生成 {ENV_FILE}")
-    if KEYS_IS_LEGACY:
-        lines.append(f"- keys.json: {ACTIVE_KEYS_FILE}（旧位置，建议移到配置目录）")
+    if keys_legacy:
+        lines.append(f"- keys.json: {keys_file}（旧位置，建议移到配置目录）")
     lines.append("")
 
     lines.append("### 搜索提供商")
     statuses = pool_status()
-    stage_one = {name for name in FREE_PROVIDERS if can_anonymous(name)}
+    stage_one = {name for name in settings.FREE_PROVIDERS if can_anonymous(name)}
     for name in REGISTRY:
         anon_calls, _ = usage.today_counts(name)
         # 带 key 的用量已经在 key 状态里（今日已用 N），这里只补充匿名调用次数
         today = f"；今日匿名调用 {anon_calls} 次" if anon_calls else ""
         # 未实测的厂商不禁用，只是排在后面、并在状态页标出来，免得以为是已验证的
         unverified = "；⚠️ 未实测（按官方文档接入，未做真实调用验证，补搜时排在已实测厂商之后）" \
-            if name in UNVERIFIED_PROVIDERS else ""
+            if name in settings.UNVERIFIED_PROVIDERS else ""
         if provider_enabled(name):
             detail = statuses.get(name) or "匿名可用，无需 key"
             detail += unverified
             if name in stage_one and has_keys(name):
                 detail += (
                     "；第一阶段匿名调用，匿名被限流、补搜或点名指定时才用 key"
-                    if ANON_KEY_FALLBACK
+                    if settings.ANON_KEY_FALLBACK
                     else "；第一阶段匿名调用，key 只在补搜或点名指定时使用"
                 )
             cooling = anon_cooling(name) if name in stage_one else 0
@@ -1208,22 +1166,25 @@ def status_text(usage_days: int | None = 0) -> str:
     lines.append(
         "- 默认顺序: " + (" → ".join(_fetch_label(name, anon) for name, anon in chain) or "无")
     )
-    if SEARCH_MODE == "free":
+    if config.force_anonymous():
+        lines.append("- 服务端禁止发送账号 key：抓取只走匿名后端")
+    elif settings.SEARCH_MODE == "free":
         lines.append("- 默认模式是 free：抓取只走匿名后端，不发送账号 key")
-    elif FETCH_KEYED_FALLBACKS:
-        lines.append(f"- 免费后端都抓不到时，最多再试 {FETCH_KEYED_FALLBACKS} 个带 key 的后端")
+    elif settings.FETCH_KEYED_FALLBACKS:
+        lines.append(f"- 免费后端都抓不到时，最多再试 {settings.FETCH_KEYED_FALLBACKS} 个带 key 的后端")
     else:
         lines.append("- 不会自动换到带 key 的后端（FETCH_KEYED_FALLBACKS=0）")
     lines.append("")
 
     ordered, _ = _escalation_order("", "auto")
     ready = [name for name in ordered if "key" in _escalation_plan(name, {}, {})]
-    excluded = [name for name in sorted(ESCALATE_EXCLUDE) if has_keys(name)]
+    excluded = [name for name in sorted(settings.ESCALATE_EXCLUDE) if has_keys(name)]
     lines.append("### 搜索成本模式")
-    lines.append(f"- 默认模式: {SEARCH_MODE}")
+    lines.append(f"- 默认模式: {settings.SEARCH_MODE}")
+    lines.append("- 账号 key 硬锁（SEARCH_NO_ACCOUNT_KEYS）: " + ("已启用" if config.force_anonymous() else "未启用"))
     lines.append(
         "- 第一阶段（匿名，不带 key）: "
-        + (", ".join(name for name in FREE_PROVIDERS if name in REGISTRY) or "无")
+        + (", ".join(name for name in settings.FREE_PROVIDERS if name in REGISTRY) or "无")
     )
     lines.append(
         f"- 当前可用于补搜的带 key 厂商: {', '.join(ready) or '无（没配 key，或都在冷却 / 已到用量上限）'}"
@@ -1231,29 +1192,29 @@ def status_text(usage_days: int | None = 0) -> str:
     if excluded:
         lines.append(f"- 不参与自动补搜（仍可用 providers 点名）: {', '.join(excluded)}")
     lines.append(
-        f"- auto 覆盖不足时自动补 {AUTO_ESCALATE_MAX} 家；escalate 每次补 {ESCALATE_COUNT} 家"
-        if AUTO_ESCALATE_MAX
-        else f"- auto 不自动补搜（AUTO_ESCALATE_MAX=0）；escalate 每次补 {ESCALATE_COUNT} 家"
+        f"- auto 覆盖不足时自动补 {settings.AUTO_ESCALATE_MAX} 家；escalate 每次补 {settings.ESCALATE_COUNT} 家"
+        if settings.AUTO_ESCALATE_MAX
+        else f"- auto 不自动补搜（AUTO_ESCALATE_MAX=0）；escalate 每次补 {settings.ESCALATE_COUNT} 家"
     )
     lines.append(f"- 本地用量上限: {_limits_text()}")
     lines.append("")
 
     lines.append("### 网络")
-    if SEARCH_PROXY:
-        who = "全部厂商" if SEARCH_PROXY_ALL else (", ".join(sorted(PROXY_PROVIDERS)) or "无")
-        lines.append(f"- SEARCH_PROXY: {redact(SEARCH_PROXY)}（用于 {who}）")
+    if settings.SEARCH_PROXY:
+        who = "全部厂商" if settings.SEARCH_PROXY_ALL else (", ".join(sorted(settings.PROXY_PROVIDERS)) or "无")
+        lines.append(f"- SEARCH_PROXY: {_loggable_url(settings.SEARCH_PROXY)}（用于 {who}）")
     else:
         lines.append("- SEARCH_PROXY: 未设置")
-    if not (SEARCH_PROXY and SEARCH_PROXY_ALL):
+    if not (settings.SEARCH_PROXY and settings.SEARCH_PROXY_ALL):
         lines.append(
             "- 其余厂商: "
-            + ("跟随系统的代理设置" if USE_SYSTEM_PROXY else "强制直连（USE_SYSTEM_PROXY=false）")
+            + ("跟随系统的代理设置" if settings.USE_SYSTEM_PROXY else "强制直连（USE_SYSTEM_PROXY=false）")
         )
-    lines.append(f"- 单家超时 {SEARCH_TIMEOUT:g} 秒；一次搜索 / 抓取的总时限 {TOTAL_TIMEOUT:g} 秒")
+    lines.append(f"- 单家超时 {settings.SEARCH_TIMEOUT:g} 秒；一次搜索 / 抓取的总时限 {settings.TOTAL_TIMEOUT:g} 秒")
     lines.append("")
 
     lines.append("### 使用记录")
-    if not USAGE_LOG:
+    if not settings.USAGE_LOG:
         lines.append("- 已关闭（USAGE_LOG=false）")
     else:
         lines.append(f"- 记录文件: {USAGE_LOG_FILE}（只在本机）")
@@ -1265,6 +1226,7 @@ def status_text(usage_days: int | None = 0) -> str:
 
 
 @mcp.tool()
+@config.with_runtime_settings
 async def web_status(usage_days: int | None = None) -> str:
     """查看各搜索厂商的配置与 key 状态（数量、可用数、冷却、今日用量）、抓取顺序和配置文件位置。
 
@@ -1273,7 +1235,6 @@ async def web_status(usage_days: int | None = None) -> str:
     Args:
         usage_days: 大于 0 时附带近 N 天的使用记录汇总（各家调用次数、成功率、耗时、动用 key 的比例）
     """
-    reload_if_changed()
     return status_text(usage_days)
 
 
@@ -1286,7 +1247,10 @@ def is_loopback(host: str) -> bool:
     host = (host or "").strip().lower().strip("[]")
     if host in LOOPBACK_HOSTS:
         return True
-    return host.startswith("127.")
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def http_guard_error(host: str, token: str) -> str:
@@ -1309,23 +1273,74 @@ def http_guard_error(host: str, token: str) -> str:
     return ""
 
 
-def _bearer_guard(app, token: str):
+def _bearer_guard(app, token: str, *, validate_origin: bool = False):
     """给 HTTP 应用套一层 Bearer 鉴权中间件。"""
     from starlette.responses import JSONResponse
+
+    expected = b"Bearer " + token.encode("utf-8")
 
     async def middleware(scope, receive, send):
         if scope["type"] != "http":
             await app(scope, receive, send)
             return
         headers = dict(scope.get("headers") or [])
-        auth = headers.get(b"authorization", b"").decode("latin-1")
-        if auth != f"Bearer {token}":
+        auth = headers.get(b"authorization", b"")
+        if not hmac.compare_digest(auth, expected):
             response = JSONResponse({"error": "unauthorized"}, status_code=401)
             await response(scope, receive, send)
             return
+        if validate_origin and (origins := [value for name, value in scope.get("headers", ()) if name == b"origin"]):
+            host = headers.get(b"host", b"").lower()
+            allowed = (b"http://" + host, b"https://" + host)
+            if not host or len(origins) != 1 or origins[0].lower() not in allowed:
+                await JSONResponse({"error": "invalid origin"}, status_code=403)(scope, receive, send)
+                return
         await app(scope, receive, send)
 
     return middleware
+
+
+async def _serve_stdio() -> None:
+    try:
+        await mcp.run_stdio_async()
+    finally:
+        await close_clients()
+
+
+def _http_app(host: str):
+    remote = not is_loopback(host)
+    if problem := http_guard_error(host, MCP_HTTP_TOKEN):
+        raise RuntimeError(problem)
+    security = getattr(mcp.settings, "transport_security", None)
+    if security is not None:
+        if remote:
+            # 默认 Host 白名单只认回环地址。远程入口由 Bearer 和 Origin 校验保护。
+            security = security.model_copy(update={"enable_dns_rebinding_protection": False})
+        else:
+            authority = host.strip("[]").lower()
+            if ":" in authority:
+                authority = f"[{authority}]"
+            hosts = [authority, authority + ":*"]
+            origins = [f"{scheme}://{host}" for scheme in ("http", "https") for host in hosts]
+            security = security.model_copy(update={
+                "allowed_hosts": list(dict.fromkeys(security.allowed_hosts + hosts)),
+                "allowed_origins": list(dict.fromkeys(security.allowed_origins + origins)),
+            })
+        mcp.settings.transport_security = security
+    app = mcp.streamable_http_app()
+    session_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(application):
+        # FastMCP 的 lifespan 按协议会话触发；共享出站连接应在整个 HTTP 应用退出时关闭。
+        try:
+            async with session_lifespan(application) as state:
+                yield state
+        finally:
+            await close_clients()
+
+    app.router.lifespan_context = lifespan
+    return _bearer_guard(app, MCP_HTTP_TOKEN, validate_origin=remote) if MCP_HTTP_TOKEN else app
 
 
 def main(transport: str = "stdio", host: str | None = None, port: int | None = None) -> None:
@@ -1335,11 +1350,7 @@ def main(transport: str = "stdio", host: str | None = None, port: int | None = N
     enabled = enabled_search_providers()
     # 日志一律走 stderr，不会污染 stdio 协议通道
     log(f"v{__version__} 配置目录: {CONFIG_DIR}; 启用搜索提供商: {', '.join(enabled) or '无'}")
-    legacy = [
-        str(path)
-        for path, is_legacy in ((ACTIVE_ENV_FILE, ENV_IS_LEGACY), (ACTIVE_KEYS_FILE, KEYS_IS_LEGACY))
-        if is_legacy
-    ]
+    legacy = [str(path) for path, is_legacy in config.active_files() if is_legacy]
     if legacy:
         log(
             f"正在读取旧位置的配置（{'、'.join(legacy)}）。"
@@ -1354,7 +1365,7 @@ def main(transport: str = "stdio", host: str | None = None, port: int | None = N
     threading.Thread(target=ssl_context, daemon=True).start()
 
     if transport == "stdio":
-        mcp.run()   # 默认 stdio
+        asyncio.run(_serve_stdio())
         return
 
     bind_host = host or "127.0.0.1"
@@ -1366,14 +1377,9 @@ def main(transport: str = "stdio", host: str | None = None, port: int | None = N
     mcp.settings.host = bind_host
     mcp.settings.port = bind_port
     log(f"HTTP 传输已启用：http://{bind_host}:{bind_port}{mcp.settings.streamable_http_path}")
-    if MCP_HTTP_TOKEN:
-        # 套一层 Bearer 校验；不配 Token 时只允许回环（上面已经拦下非回环的情况）
-        app = mcp.streamable_http_app()
-        import uvicorn
-        uvicorn.run(_bearer_guard(app, MCP_HTTP_TOKEN), host=bind_host, port=bind_port,
-                    log_level="warning")
-        return
-    mcp.run(transport="streamable-http")
+    import uvicorn
+
+    uvicorn.run(_http_app(bind_host), host=bind_host, port=bind_port, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from .base import (
     as_items,
     brief,
     business_status,
+    date_metadata,
     post_json,
     text_of,
 )
@@ -47,7 +48,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
             title=text_of(item.get("title")),
             snippet=text_of(item.get("snippet")),
             rank=i,
-            published=text_of(item.get("page_age")),
+            dates=date_metadata(page_age=item.get("page_age")),
         )
         for i, item in enumerate(items)
     ]

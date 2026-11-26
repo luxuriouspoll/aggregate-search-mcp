@@ -10,26 +10,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import weakref
 import ssl
 import threading
 import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import httpx
 
-from .. import usage
-from ..config import (
-    API_KEYS,
-    ENABLE_KEYLESS,
-    PROXY_PROVIDERS,
-    RATE_COOLDOWN,
-    SEARCH_PROXY,
-    SEARCH_PROXY_ALL,
-    SEARXNG_BASE_URL,
-    SEARCH_PROVIDERS_LIMIT,
-    USE_SYSTEM_PROXY,
-)
+from .. import config, usage
 from ..keypool import KeyPool, _fingerprint
 from . import (
     anysearch,
@@ -53,7 +46,7 @@ from . import (
     zhipu,
 )
 from .base import (
-    NATIVE_FILTER_PROVIDERS,
+    NATIVE_DOMAIN_PROVIDERS,
     NETWORK_ERROR,
     FetchResult,
     ProviderError,
@@ -94,48 +87,68 @@ REGISTRY: dict[str, tuple] = {
     "duckduckgo": (duckduckgo.search, None),
 }
 
-# 不带 key 也能调用的源（KEYLESS_KNOWN），以及其中默认就参与搜索的（KEYLESS_ENABLED）：
-# - parallel / keenable / anysearch：匿名免费，国内直连实测可用，默认启用
-# - duckduckgo / firecrawl 匿名 / youcom：受 ENABLE_KEYLESS 开关控制，避免超时或重复计费
-# - searxng：填实例地址即启用
-KEYLESS_KNOWN: set[str] = {"parallel", "anysearch", "keenable", "youcom", "duckduckgo", "firecrawl"} | (
-    {"searxng"} if SEARXNG_BASE_URL else set()
-)
-KEYLESS_ENABLED: set[str] = {"parallel", "anysearch", "keenable"} | (
-    set(KEYLESS_KNOWN) if ENABLE_KEYLESS else set()
-)
-if SEARXNG_BASE_URL:
-    KEYLESS_ENABLED.add("searxng")
+# SEARXNG 填实例地址才启用；DuckDuckGo 等免 key 源须点名或打开 ENABLE_KEYLESS。
+KEYLESS_KNOWN = frozenset({"parallel", "anysearch", "keenable", "youcom", "duckduckgo", "firecrawl"})
+_DEFAULT_KEYLESS = frozenset({"parallel", "anysearch", "keenable"})
+
+
+def keyless_enabled() -> frozenset[str]:
+    settings = config.get_settings()
+    names = KEYLESS_KNOWN if settings.ENABLE_KEYLESS else _DEFAULT_KEYLESS
+    return names | {"searxng"} if settings.SEARXNG_BASE_URL else names
+
 
 FETCH_PROVIDERS: list[str] = [name for name, (_, fetch_fn) in REGISTRY.items() if fetch_fn]
-POOLS: dict[str, KeyPool] = {
-    name: KeyPool(name, list(keys)) for name, keys in API_KEYS.items() if name in REGISTRY
-}
+_POOL_LOCK = threading.RLock()
+_POOLS: dict[str, KeyPool] = {}
+
+
+def _rotate_pool(name: str, keys: tuple[str, ...], old: KeyPool | None) -> KeyPool:
+    if old is not None and tuple(old.keys) == keys:
+        return old
+    pool = KeyPool(name, list(keys))
+    if old and keys:
+        next_key = old.keys[old._cursor % len(old.keys)]
+        if next_key in keys:
+            pool._cursor = keys.index(next_key)
+    return pool
+
+
+def key_pool(name: str) -> KeyPool:
+    """保留相同 Key 列表的轮转状态；改动时换池，不修改在途请求持有的池。"""
+    with _POOL_LOCK:
+        current = config.get_settings().API_KEYS.get(name, ())
+        live = config.get_live_settings().API_KEYS.get(name, ())
+        pool = _rotate_pool(name, live, _POOLS.get(name))
+        if pool:
+            _POOLS[name] = pool
+        else:
+            _POOLS.pop(name, None)
+        return _rotate_pool(name, current, pool)
+
+
+def get_pools() -> dict[str, KeyPool]:
+    return {name: key_pool(name) for name in REGISTRY if has_keys(name)}
 
 
 def has_keys(name: str) -> bool:
-    pool = POOLS.get(name)
-    return bool(pool and pool.keys)
+    return bool(config.get_settings().API_KEYS.get(name))
 
 
 def can_anonymous(name: str) -> bool:
     """这家不带 key 能不能调用。"""
-    return name in KEYLESS_KNOWN
+    return name in KEYLESS_KNOWN or (name == "searxng" and bool(config.get_settings().SEARXNG_BASE_URL))
 
 
 def auth_for(name: str, anonymous: bool = False) -> str:
     """这次调用走哪个通道：'key'（带账号 key）或 'anon'（匿名）。"""
-    return "key" if has_keys(name) and not anonymous else "anon"
+    return "key" if has_keys(name) and not anonymous and not config.force_anonymous() else "anon"
 
 
 def provider_enabled(name: str, explicit: bool = False) -> bool:
-    if has_keys(name):
+    if has_keys(name) and not config.force_anonymous():
         return True
-    if name == "searxng" and SEARXNG_BASE_URL:
-        return True
-    if explicit and name in KEYLESS_KNOWN:
-        return True
-    return name in KEYLESS_ENABLED
+    return (explicit and can_anonymous(name)) or name in keyless_enabled()
 
 
 _SSL_LOCK = threading.Lock()
@@ -171,6 +184,25 @@ def _same_site(origin: str, target: str) -> bool:
     return "." in short and long.endswith("." + short)
 
 
+# 重定向和同一适配器里的后续 HTTP 请求也受硬锁约束。
+_ACCOUNT_CALL: ContextVar[bool] = ContextVar("aggregate_search_account_call", default=False)
+_DEADLINE: ContextVar[float | None] = ContextVar("aggregate_search_deadline", default=None)
+
+
+def _check_deadline() -> None:
+    deadline = _DEADLINE.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ProviderError(f"{NETWORK_ERROR}: 等待超过总时限，已放弃", sent=False)
+
+
+async def _guard_account_request(request: httpx.Request) -> None:
+    # 这些 API 不依赖 Cookie 鉴权；连接池可共享，但不能复用别的账号的 Cookie。
+    request.headers.pop("Cookie", None)
+    _check_deadline()
+    if _ACCOUNT_CALL.get() and config.force_anonymous():
+        raise ProviderError("服务端已禁止发送账号 key", sent=False)
+
+
 async def _keep_keys_on_host(response: httpx.Response) -> None:
     """带着 key 的请求只允许在同一个站点内跳转。
 
@@ -181,7 +213,7 @@ async def _keep_keys_on_host(response: httpx.Response) -> None:
         return
     request = response.request
     carried = " ".join(request.headers.values())
-    if redact(carried) == carried:
+    if not _ACCOUNT_CALL.get() and redact(carried) == carried:
         return  # 请求头里没有任何已配置的 key
     try:
         destination = request.url.join(response.headers.get("location", ""))
@@ -199,73 +231,103 @@ async def _keep_keys_on_host(response: httpx.Response) -> None:
         )
 
 
-def _network_profile(name: str) -> tuple[str, bool]:
-    """这家走哪种网络：('proxy', 代理地址) 或 ('direct', True/False 是否跟随系统代理)。"""
-    if SEARCH_PROXY and (SEARCH_PROXY_ALL or name in PROXY_PROVIDERS):
-        return "proxy", True
-    return "direct", not USE_SYSTEM_PROXY
+_NetworkProfile = tuple[str, str | bool]
 
 
-def _client_kwargs(profile: tuple[str, bool]) -> dict:
-    kind, flag = profile
+def _network_profile(name: str, settings=None) -> _NetworkProfile:
+    """这家走哪种网络：('proxy', 代理地址) 或 ('system', 是否跟随系统代理)。"""
+    settings = config.get_settings() if settings is None else settings
+    if settings.SEARCH_PROXY and (settings.SEARCH_PROXY_ALL or name in settings.PROXY_PROVIDERS):
+        return "proxy", settings.SEARCH_PROXY
+    return "system", settings.USE_SYSTEM_PROXY
+
+
+def _client_kwargs(profile: _NetworkProfile) -> dict:
+    kind, value = profile
     kwargs: dict = {
         "follow_redirects": True,
         "verify": ssl_context(),
-        "event_hooks": {"response": [_keep_keys_on_host]},
+        "event_hooks": {"request": [_guard_account_request], "response": [_keep_keys_on_host]},
     }
     if kind == "proxy":
-        kwargs["proxy"] = SEARCH_PROXY
-    elif flag:
-        kwargs["trust_env"] = False  # 不读系统代理和 HTTP(S)_PROXY，强制直连
+        kwargs.update(proxy=value, trust_env=False)
+    else:
+        kwargs["trust_env"] = value
     return kwargs
 
 
 def _client(name: str) -> httpx.AsyncClient:
-    """按 provider 决定走哪条网络：指定的代理、系统设置，或强制直连。"""
+    """按 provider 决定走指定代理、系统设置或强制直连。"""
     return httpx.AsyncClient(**_client_kwargs(_network_profile(name)))
 
 
-# 按（事件循环, 网络配置）复用客户端。httpx 的连接池绑在事件循环上，
-# 所以必须用 WeakKeyDictionary 绑到循环——循环销毁时自动回收，
-# 多个 asyncio.run() 各用各的池，不会出现 "Event loop is closed"。
+@dataclass
+class _ClientSlot:
+    client: httpx.AsyncClient
+    active: int = 0
+
+
+# 连接池绑定事件循环和实际代理配置；不在热加载入口关闭正在使用的池。
 _CLIENTS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_CLIENT_LOCK = threading.RLock()
+
+
+def _get_client_slot(name: str):
+    loop = asyncio.get_running_loop()
+    profile = _network_profile(name)
+    with _CLIENT_LOCK:
+        per_loop = _CLIENTS.setdefault(loop, {})
+        slot = per_loop.get(profile)
+        if slot is None or slot.client.is_closed:
+            slot = per_loop[profile] = _ClientSlot(_client(name))
+        return per_loop, slot
 
 
 async def get_client(name: str) -> httpx.AsyncClient:
-    """取（或新建）本事件循环下这家专用的共享客户端。
+    """取当前配置的共享连接池；实际派发用 client_for 持有租约。"""
+    return _get_client_slot(name)[1].client
 
-    复用连接省掉每次握手和 TLS 协商；不用 async with，由调用方直接 await 使用。
-    """
-    loop = asyncio.get_running_loop()
-    profile = _network_profile(name)
-    per_loop = _CLIENTS.setdefault(loop, {})
-    client = per_loop.get(profile)
-    if client is not None and not client.is_closed:
-        return client
-    client = httpx.AsyncClient(**_client_kwargs(profile))
-    per_loop[profile] = client
-    return client
+
+async def _close_client(client: httpx.AsyncClient) -> None:
+    try:
+        await client.aclose()
+    except Exception:
+        pass
+
+
+async def _close_idle_clients(per_loop: dict) -> None:
+    live = config.get_live_settings()
+    profiles = {_network_profile(name, live) for name in REGISTRY}
+    retired = [profile for profile, slot in per_loop.items() if not slot.active and profile not in profiles]
+    clients = [per_loop.pop(profile).client for profile in retired]
+    for client in clients:
+        await _close_client(client)
+
+
+@asynccontextmanager
+async def client_for(name: str):
+    per_loop, slot = _get_client_slot(name)
+    slot.active += 1
+    try:
+        await _close_idle_clients(per_loop)
+        yield slot.client
+    finally:
+        slot.active -= 1
+        await _close_idle_clients(per_loop)
 
 
 async def close_clients() -> None:
-    """关掉当前事件循环下的共享客户端（进程退出或测试清理时用）。"""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    per_loop = _CLIENTS.pop(loop, {})
-    for client in per_loop.values():
-        try:
-            await client.aclose()
-        except Exception:
-            pass
+    """关掉当前事件循环下的共享客户端（退出或测试清理时用）。"""
+    with _CLIENT_LOCK:
+        per_loop = _CLIENTS.pop(asyncio.get_running_loop(), {})
+    for slot in per_loop.values():
+        await _close_client(slot.client)
 
 
 def enabled_search_providers() -> list[str]:
     names = [name for name in REGISTRY if REGISTRY[name][0] and provider_enabled(name)]
-    if SEARCH_PROVIDERS_LIMIT:
-        names = [name for name in names if name in SEARCH_PROVIDERS_LIMIT]
-    return names
+    allowed = config.get_settings().SEARCH_PROVIDERS_LIMIT
+    return [name for name in names if name in allowed] if allowed else names
 
 
 @dataclass
@@ -279,6 +341,7 @@ class CallRecord:
     anon_sent: bool = False  # 是否真的发出过匿名请求
     ok: bool = False
     count: int = 0
+    filtered_count: int | None = None
     ms: int = 0
     error: str = ""
     fallback: bool = False  # 本想匿名调用，匿名通道被限流后才改用 key
@@ -306,6 +369,8 @@ class CallRecord:
 
     def as_log(self) -> dict:
         entry = {"p": self.provider, "auth": self.auth, "ok": self.ok, "n": self.count, "ms": self.ms}
+        if self.filtered_count is not None:
+            entry["filtered_n"] = self.filtered_count
         if self.auth == "key":
             entry["keys"] = self.keys_tried  # 实际发出了几次带 key 的请求；0 = key 没用上
         if self.key_index:
@@ -319,14 +384,18 @@ class CallRecord:
         return entry
 
 
-# 匿名通道被限流后的冷却：厂商 -> 恢复时间。冷却期内不再白发匿名请求
-# （实测一次被拒要白等 2.5 秒）。只放内存，进程重启即清空。
-_ANON_COOLDOWN: dict[str, float] = {}
+# 代理或端点配置更新后，不能用旧通道的匿名限流状态推动账号回退。
+_ANON_COOLDOWN: dict[str, tuple[int, float]] = {}
 
 
 def anon_cooling(name: str) -> int:
     """匿名通道还要冷却多少秒；0 表示可用。"""
-    left = _ANON_COOLDOWN.get(name, 0.0) - time.time()
+    if (entry := _ANON_COOLDOWN.get(name)) is None:
+        return 0
+    revision, reset_at = entry
+    if revision != config.get_settings().revision:
+        return 0
+    left = reset_at - time.time()
     if left <= 0:
         _ANON_COOLDOWN.pop(name, None)
         return 0
@@ -336,31 +405,56 @@ def anon_cooling(name: str) -> int:
 def _note_anon_failure(name: str, exc: ProviderError) -> None:
     """匿名通道被拒（限流 / 额度 / 要求登录）就歇一会儿，别每次搜索都白发一次。"""
     if exc.status in (401, 402, 403, 429):
-        wait = exc.retry_after if exc.retry_after is not None else RATE_COOLDOWN
-        if wait > 0:
-            _ANON_COOLDOWN[name] = time.time() + wait
+        settings = config.get_settings()
+        wait = exc.retry_after
+        if wait is None or not math.isfinite(wait):
+            wait = settings.RATE_COOLDOWN
+        if wait > 0 and settings.revision == config.get_live_settings().revision:
+            _ANON_COOLDOWN[name] = settings.revision, time.time() + wait
 
 
-async def _with_keys(name: str, call, record: CallRecord | None = None):
+async def _with_keys(name: str, call, record: CallRecord | None = None, *, pool: KeyPool | None = None):
     """通用 key 轮询执行器，返回 (结果, 成功的那个 key)。
 
     保证异常时也会释放 in-flight 占用。每取到一个 key 就把 record.keys_tried 加一，
     所以哪怕中途出错或被总时限取消，「到底发出了几次带 key 的请求」也不会记错。
     一个 key 都没拿到（全在冷却 / 到量）时抛出的错误带 sent=False。
     """
-    pool = POOLS[name]
+    if pool is None:
+        pool = key_pool(name)
     attempted: set[str] = set()
+    sent = 0
     last_error: ProviderError | None = None
     while True:
-        key = pool.next_key(attempted)
+        if config.force_anonymous():
+            raise ProviderError("服务端已禁止发送账号 key", sent=bool(sent))
+        _check_deadline()
+        current, live = config.get_settings(), config.get_live_settings()
+        revoked = (() if current.revision == live.revision else set(pool.keys) - set(live.API_KEYS.get(name, ())))
+        key = pool.next_key(attempted | {_fingerprint(key) for key in revoked})
         if key is None:
             break
         attempted.add(_fingerprint(key))
-        if record is not None:
-            record.keys_tried = len(attempted)
+        token = _ACCOUNT_CALL.set(True)
+        invoked = False
         try:
+            if config.force_anonymous():
+                raise ProviderError("服务端已禁止发送账号 key", sent=False)
+            _check_deadline()
+            invoked = True
+            sent += 1
+            if record is not None:
+                record.keys_tried = sent
             value = await call(key)
         except ProviderError as exc:
+            if not exc.sent:
+                # 例如等待出站钩子期间开启硬锁：已经预占，但这一次没有发送。
+                if invoked:
+                    sent -= 1
+                if record is not None:
+                    record.keys_tried = sent
+                if sent:
+                    raise ProviderError(str(exc), status=exc.status) from exc
             last_error = exc
             pool.record_failure(key, exc.status, redact(str(exc)), exc.retry_after, exc.soft)
             if exc.retryable_with_other_key:
@@ -370,6 +464,7 @@ async def _with_keys(name: str, call, record: CallRecord | None = None):
             pool.record_success(key)
             return value, key
         finally:
+            _ACCOUNT_CALL.reset(token)
             pool.release(key)
 
     if last_error is not None:
@@ -379,17 +474,18 @@ async def _with_keys(name: str, call, record: CallRecord | None = None):
             retry_after=last_error.retry_after,
         )
     # 走到这里说明一个 key 都没拿到，请求根本没发出去
-    reason = pool.capped_reason()
-    if reason and not pool.usable():
+    status = pool._status()
+    if status.unreliable:
+        raise ProviderError("该家的用量无法可靠记账，已跳过账号请求", sent=False)
+    if status.reason and not status.usable:
         raise ProviderError(
-            f"该家的 key 已到本地用量上限（{reason}），到期自动恢复；"
+            f"该家的 key 已到本地用量上限（{status.reason}），到期自动恢复；"
             "可在 .env 里用 DAILY_LIMITS / MONTHLY_LIMITS 调整",
             status=429,
             sent=False,
         )
-    reset = pool.earliest_reset()
-    if reset:
-        left = max(0, int(reset - time.time()))
+    if status.reset:
+        left = max(0, int(status.reset - time.time()))
         raise ProviderError(
             f"该家所有 key 都在冷却中，最早 {left} 秒后恢复", status=429, sent=False
         )
@@ -409,11 +505,12 @@ def _tidy(results) -> list[SearchResult]:
         url = text_of(item.url)
         if not url.lower().startswith(("http://", "https://")):
             continue
-        item.url = url
-        item.title = text_of(item.title)
-        item.snippet = text_of(item.snippet)
-        item.published = text_of(item.published)
-        if not isinstance(item.rank, int) or isinstance(item.rank, bool):
+        item.url = redact(url)
+        item.title = redact(text_of(item.title))
+        item.snippet = redact(text_of(item.snippet))
+        item.published = redact(text_of(item.published))
+        item.dates = tuple((kind, redact(raw)) for kind, raw in item.dates)
+        if not isinstance(item.rank, int) or isinstance(item.rank, bool) or item.rank < 0:
             item.rank = len(tidy)
         tidy.append(item)
     return tidy
@@ -433,6 +530,8 @@ async def search_one(
     record: CallRecord | None = None,
     time_range: str = "",
     domains=(),
+    as_of: datetime | None = None,
+    deadline: float | None = None,
 ) -> CallRecord:
     """调用一家搜索。永不抛业务异常：成败、耗时、用没用 key 都写在返回的记录里。
 
@@ -443,7 +542,9 @@ async def search_one(
     if record is None:
         record = CallRecord(provider=name, auth=auth_for(name, anonymous))
     started = time.monotonic()
+    budget = _DEADLINE.set(deadline)
     try:
+        _check_deadline()
         search_fn = REGISTRY[name][0] if name in REGISTRY else None
         if search_fn is None:
             raise ProviderError(f"{name} 不支持搜索", sent=False)
@@ -452,36 +553,38 @@ async def search_one(
                 f"{name} 不支持匿名调用" if anonymous else f"{name} 未配置 API key",
                 sent=False,
             )
-        # 不支持原生站点过滤的引擎，把站点条件拼进查询；支持的用原生参数。
-        # 不支持原生站点过滤的引擎，把站点条件拼进查询；支持的用原生参数。
-        filter_token = set_filters(time_range, domains)
+        # 原生时间和站点能力分开；不支持原生站点参数的引擎用 site:。
+        filter_token = set_filters(time_range, domains, as_of)
         try:
-            effective_query = query if name in NATIVE_FILTER_PROVIDERS else query_with_sites(query)
-            can_fall_back = key_fallback and has_keys(name)
-            client = await get_client(name)
-            if record.auth == "anon":
-                cooling = anon_cooling(name)
-                if cooling and not (can_fall_back and POOLS[name].usable()):
-                    raise ProviderError(
-                        f"匿名通道刚被限流，约 {cooling} 秒后再试", status=429, sent=False
+            effective_query = query if name in NATIVE_DOMAIN_PROVIDERS else query_with_sites(query)
+            can_fall_back = key_fallback and has_keys(name) and not config.force_anonymous()
+            pool = key_pool(name)
+            async with client_for(name) as client:
+                if record.auth == "anon":
+                    cooling = anon_cooling(name)
+                    if cooling and not (can_fall_back and pool.usable()):
+                        raise ProviderError(
+                            f"匿名通道刚被限流，约 {cooling} 秒后再试", status=429, sent=False
+                        )
+                    if cooling:
+                        record.auth, record.fallback = "key", True  # 冷却中，直接用 key，不白发匿名请求
+                    else:
+                        _check_deadline()
+                        usage.count_call(name, usage.ANON)
+                        _check_deadline()
+                        record.anon_sent = True
+                        try:
+                            record.results = await search_fn(client, "", effective_query, max_results)
+                        except ProviderError as exc:
+                            _note_anon_failure(name, exc)
+                            if not (can_fall_back and exc.retryable_with_other_key and pool.usable()):
+                                raise
+                            record.auth, record.fallback = "key", True
+                if record.auth == "key":
+                    record.results, used_key = await _with_keys(
+                        name, lambda key: search_fn(client, key, effective_query, max_results), record, pool=pool
                     )
-                if cooling:
-                    record.auth, record.fallback = "key", True  # 冷却中，直接用 key，不白发匿名请求
-                else:
-                    usage.count_call(name, usage.ANON)
-                    record.anon_sent = True
-                    try:
-                        record.results = await search_fn(client, "", effective_query, max_results)
-                    except ProviderError as exc:
-                        _note_anon_failure(name, exc)
-                        if not (can_fall_back and exc.retryable_with_other_key and POOLS[name].usable()):
-                            raise
-                        record.auth, record.fallback = "key", True
-            if record.auth == "key":
-                record.results, used_key = await _with_keys(
-                    name, lambda key: search_fn(client, key, effective_query, max_results), record
-                )
-                record.key_index = POOLS[name].index_of(used_key)
+                    record.key_index = pool.index_of(used_key)
             record.results = _tidy(record.results)
             record.ok = True
             record.count = len(record.results)
@@ -490,6 +593,7 @@ async def search_one(
     except Exception as exc:  # CancelledError 是 BaseException，不会被这里吞掉
         record.error = _describe(exc)
     finally:
+        _DEADLINE.reset(budget)
         record.ms = int((time.monotonic() - started) * 1000)
     return record
 
@@ -503,6 +607,7 @@ async def run_search(
     deadline: float | None = None,
     time_range: str = "",
     domains=None,
+    as_of: datetime | None = None,
 ):
     """并发查询多家，返回 (结果, 错误, 调用记录)。
 
@@ -524,7 +629,12 @@ async def run_search(
         CallRecord(provider=name, auth=auth_for(name, force_all or name in anonymous))
         for name in names
     ]
-    # 过滤条件作为参数显式传下去：ensure_future 创建的任务不继承当前 contextvar
+    timeout = None if deadline is None else deadline - time.monotonic()
+    if timeout is not None and timeout <= 0:
+        for record in records:
+            record.error = f"{NETWORK_ERROR}: 等待超过总时限，已放弃"
+            errors[record.provider] = record.error
+        return results, errors, records
     tasks = [
         asyncio.ensure_future(search_one(
             name, query, max_results,
@@ -533,15 +643,17 @@ async def run_search(
             record=record,
             time_range=time_range,
             domains=domains,
+            as_of=as_of,
+            deadline=deadline,
         ))
         for name, record in zip(names, records)
     ]
-    timeout = None if deadline is None else max(0.1, deadline - time.monotonic())
     try:
         _, pending = await asyncio.wait(tasks, timeout=timeout)
     except BaseException:
         for task in tasks:  # 整次搜索被取消时，别把子任务留在后台继续花额度
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         raise
     for task in pending:
         task.cancel()
@@ -576,27 +688,28 @@ async def run_fetch(name: str, url: str, anonymous: bool = False) -> FetchResult
             f"{name} 不支持匿名抓取" if anonymous else f"{name} 未配置 API key 或不可用",
             sent=False,
         )
-    client = await get_client(name)
-    if auth == "anon":
-        cooling = anon_cooling(name)
-        if cooling:
-            raise ProviderError(
-                f"匿名通道刚被限流，约 {cooling} 秒后再试", status=429, sent=False
-            )
-        usage.count_call(name, usage.ANON)
-        try:
-            result = await fetch_fn(client, "", url)
-        except ProviderError as exc:
-            # 抓取工具自己报的错不带状态码（见 base.fetch_error），不会触发冷却；
-            # 只有 HTTP 层明确的 401 / 402 / 403 / 429 才会让匿名通道歇一会儿
-            _note_anon_failure(name, exc)
-            raise
-    else:
-        result, _ = await _with_keys(name, lambda key: fetch_fn(client, key, url))
+    async with client_for(name) as client:
+        if auth == "anon":
+            cooling = anon_cooling(name)
+            if cooling:
+                raise ProviderError(
+                    f"匿名通道刚被限流，约 {cooling} 秒后再试", status=429, sent=False
+                )
+            usage.count_call(name, usage.ANON)
+            try:
+                result = await fetch_fn(client, "", url)
+            except ProviderError as exc:
+                # 抓取工具自己报的错不带状态码（见 base.fetch_error），不会触发冷却；
+                # 只有 HTTP 层明确的 401 / 402 / 403 / 429 才会让匿名通道歇一会儿
+                _note_anon_failure(name, exc)
+                raise
+        else:
+            result, _ = await _with_keys(name, lambda key: fetch_fn(client, key, url))
     if not isinstance(result, FetchResult):
         raise ProviderError(f"{name} 返回的不是抓取结果")
-    result.title = text_of(result.title)
-    result.content = text_of(result.content)
+    result.url = redact(text_of(result.url))
+    result.title = redact(text_of(result.title))
+    result.content = redact(text_of(result.content))
     if not result.content:
         # 「成功但什么都没抓到」对调用方没有用，按失败处理，好让上层换下一个后端
         raise ProviderError(f"{name} 抓取成功但正文为空")
@@ -606,35 +719,4 @@ async def run_fetch(name: str, url: str, anonymous: bool = False) -> FetchResult
 
 
 def pool_status() -> dict[str, str]:
-    return {
-        name: POOLS[name].status_line()
-        for name in REGISTRY
-        if name in POOLS and POOLS[name].keys
-    }
-
-
-def refresh_pools(keys_by_provider: dict[str, list[str]]) -> None:
-    """按新的 key 字典就地刷新各家 key 池（热加载用）。
-
-    保留还存在的 key 的轮转位置：不会因为改了一个厂商的 key，就把其它家的
-    轮转游标全部重置回第一个 key。已删除的 key 会被移除，冷却状态按指纹自动失效。
-    """
-    for name, keys in keys_by_provider.items():
-        if name not in REGISTRY:
-            continue
-        pool = POOLS.get(name)
-        if pool is None:
-            POOLS[name] = KeyPool(name, list(keys))
-            continue
-        # 记住当前正准备用的那个 key，新列表里还在的话，游标顺着它往后走
-        current = pool.keys[pool._cursor % len(pool.keys)] if pool.keys else None
-        pool.keys = list(keys)
-        if pool.keys:
-            if current in pool.keys:
-                pool._cursor = (pool.keys.index(current) + 1) % len(pool.keys)
-            else:
-                pool._cursor = min(pool._cursor, len(pool.keys) - 1)
-    # 配置里删掉的厂商，池子也收起来
-    for name in list(POOLS):
-        if not keys_by_provider.get(name):
-            POOLS.pop(name, None)
+    return {name: pool.status_line() for name, pool in get_pools().items()}

@@ -9,21 +9,22 @@ from __future__ import annotations
 
 import httpx
 
-from ..config import FIRECRAWL_BASE_URL
+from .. import config
 from .base import (
     FetchResult,
     SearchResult,
     as_dict,
     as_items,
     business_error,
+    date_metadata,
     fetch_error,
     post_json,
     text_of,
     wants_time,
 )
 
-SEARCH_URL = f"{FIRECRAWL_BASE_URL}/v2/search"
-SCRAPE_URL = f"{FIRECRAWL_BASE_URL}/v2/scrape"
+def _endpoint(action: str) -> str:
+    return f"{config.get_settings().FIRECRAWL_BASE_URL}/v2/{action}"
 
 
 def _check(data: dict, fetching: bool = False) -> dict:
@@ -40,7 +41,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
     tbs = wants_time("firecrawl")           # qdr:d / qdr:w / qdr:m / qdr:y
     if tbs:
         payload["tbs"] = tbs
-    data = _check(await post_json(client, SEARCH_URL, key=key, payload=payload))
+    data = _check(await post_json(client, _endpoint("search"), key=key, payload=payload))
     items = as_items(data, "data", "web")
     return [
         SearchResult(
@@ -49,13 +50,15 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
             title=text_of(item.get("title")),
             snippet=text_of(item.get("description")),
             rank=i,
+            published=text_of(item.get("publishedDate")),
+            dates=date_metadata(source_date=item.get("date")),
         )
         for i, item in enumerate(items)
     ]
 
 
 async def fetch(client: httpx.AsyncClient, key: str, url: str) -> FetchResult:
-    data = _check(await post_json(client, SCRAPE_URL, key=key, payload={
+    data = _check(await post_json(client, _endpoint("scrape"), key=key, payload={
         "url": url,
         "formats": ["markdown"],
     }), fetching=True)

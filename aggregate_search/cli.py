@@ -4,9 +4,9 @@
     aggregate-search init           生成全局配置目录和 .env 模板
     aggregate-search path           显示配置目录位置
     aggregate-search status         查看各家 key、冷却与用量
-    aggregate-search search 关键词   直接搜一次（--mode / --region / --providers）
+    aggregate-search search 关键词   直接搜一次（--mode / --region / --providers / --time-range / --domains）
     aggregate-search fetch URL      抓取网页正文
-    aggregate-search check          让每家各发一次真实请求，检查连通性
+    aggregate-search check          发出真实请求，检查启用的搜索通道
     aggregate-search usage [天数]    查看本地使用记录汇总
     aggregate-search selftest       离线自测（不联网、不读取也不改动你的配置）
 """
@@ -92,7 +92,7 @@ def cmd_init(source: str | None) -> int:
     print(f"  1. 用记事本等编辑器打开 {env_file}，把要用的厂商那一行去掉开头的 # 并填入 key")
     print("     （一个 key 都不填也能用：Parallel / Keenable / AnySearch 匿名免费）")
     print("  2. 运行 aggregate-search status 确认哪些厂商已启用")
-    print("  3. 改完配置后，在 MCP 客户端里重连 aggregate-search 才会生效")
+    print("  3. 保存后下一次工具调用即使用新的运行配置；监听和目录等启动配置需重启")
     return 0
 
 
@@ -122,7 +122,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     providers = [p for p in (args.providers or "").replace("，", ",").split(",") if p.strip()]
     domains = [d for d in (args.domains or "").replace("，", ",").split(",") if d.strip()]
-    text = asyncio.run(web_search(
+    text = asyncio.run(_run_once(web_search(
         " ".join(args.query),
         max_results=args.max,
         providers=providers or None,
@@ -131,7 +131,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         region=args.region,
         time_range=args.time_range,
         domains=domains or None,
-    ))
+    )))
     print(text)
     return 0
 
@@ -139,12 +139,19 @@ def cmd_search(args: argparse.Namespace) -> int:
 def cmd_fetch(url: str, backend: str) -> int:
     from .server import web_fetch
 
-    print(asyncio.run(web_fetch(url, backend)))
+    print(asyncio.run(_run_once(web_fetch(url, backend))))
     return 0
 
 
 async def _check(query: str) -> int:
-    from .config import FREE_PROVIDERS
+    from . import config
+
+    with config.use_settings():
+        return await _check_channels(query)
+
+
+async def _check_channels(query: str) -> int:
+    from . import config
     from .providers import (
         REGISTRY,
         can_anonymous,
@@ -155,11 +162,15 @@ async def _check(query: str) -> int:
     )
 
     enabled = enabled_search_providers()
-    anonymous = [n for n in FREE_PROVIDERS if n in REGISTRY and can_anonymous(n)]
-    anonymous += [n for n in enabled if not has_keys(n) and n not in anonymous]
-    keyed = [n for n in enabled if has_keys(n)]
+    free = config.force_anonymous()
+    anonymous = [n for n in config.get_settings().FREE_PROVIDERS if n in REGISTRY and can_anonymous(n)]
+    anonymous += [n for n in enabled if n not in anonymous and can_anonymous(n) and (free or not has_keys(n))]
+    keyed = [] if free else [n for n in enabled if has_keys(n)]
     print(f"测试查询: {query}")
-    print("每家会各发一次真实请求（带 key 的会消耗 1 次额度）。\n")
+    if free:
+        print("服务端已禁止发送账号 key，本次仅检查匿名通道。\n")
+    else:
+        print("会发出真实请求；账号通道可能轮换多个 key 并消耗额度。\n")
 
     failed = 0
     for title, names, force_anonymous in (
@@ -191,8 +202,17 @@ async def _check(query: str) -> int:
     return 1 if failed else 0
 
 
+async def _run_once(call):
+    from .providers import close_clients
+
+    try:
+        return await call
+    finally:
+        await close_clients()
+
+
 def cmd_check(query: str) -> int:
-    return asyncio.run(_check(query))
+    return asyncio.run(_run_once(_check(query)))
 
 
 # 自测子进程只继承这些与运行环境有关的变量；其余一律不带，
@@ -200,7 +220,7 @@ def cmd_check(query: str) -> int:
 _PASSTHROUGH_ENV = (
     "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
     "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
-    "APPDATA", "LOCALAPPDATA", "LANG", "LC_ALL", "PYTHONPATH", "VIRTUAL_ENV",
+    "APPDATA", "LOCALAPPDATA", "LANG", "LC_ALL", "VIRTUAL_ENV",
 )
 
 
@@ -216,16 +236,14 @@ def cmd_selftest(child: bool) -> int:
         env.update(SANDBOX_ENV)
         env["AGGREGATE_SEARCH_HOME"] = sandbox
         env["PYTHONIOENCODING"] = "utf-8"
-        # 从源码目录用 `python 路径/server.py selftest` 运行时，包没有装进 site-packages，
-        # 得把包所在的目录告诉子进程，否则它找不到 aggregate_search。
+        # 固定 cwd 和导入根，避免 SDK 读取当前目录的 .env 或从客户端 PYTHONPATH 载入模块。
         package_parent = str(Path(__file__).resolve().parent.parent)
-        env["PYTHONPATH"] = os.pathsep.join(
-            part for part in (package_parent, env.get("PYTHONPATH", "")) if part
-        )
+        entry = "import sys; sys.path.insert(0, sys.argv.pop(1)); from aggregate_search.cli import main; main()"
         print("离线自测：在临时沙盒里运行，不联网，不读取也不改动你的配置。\n")
         sys.stdout.flush()
         done = subprocess.run(
-            [sys.executable, "-m", "aggregate_search", "selftest", "--child"], env=env
+            [sys.executable, "-I", "-B", "-c", entry, package_parent, "selftest", "--child"],
+            cwd=sandbox, env=env,
         )
     return done.returncode
 

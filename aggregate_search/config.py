@@ -8,9 +8,8 @@ r"""集中读取配置。
 目录内的文件：
     .env                  key 与各项开关
     keys.json             可选，集中管理多 key
-    key-state.json        key 冷却状态（只存哈希）
+    state.db              key 冷却状态与日 / 月用量（只存哈希）
     usage.jsonl           本地使用记录
-    usage-counters.json   每个 key 当日 / 当月已用次数
 
 优先级：进程环境变量（MCP 客户端注册时传的 env）> .env > keys.json。
 每家的 key 支持多个（逗号 / 换行 / 分号分隔），运行期做轮询；
@@ -24,10 +23,19 @@ import math
 import os
 import re
 import sys
+import threading
+from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
+from functools import cached_property, partial, wraps
 from pathlib import Path
+from types import MappingProxyType
 
 
-_HOME_OVERRIDE: str = os.environ.get("AGGREGATE_SEARCH_HOME", "").strip().strip("\"'")
+# 在读任何文件之前截取客户端环境；.env 不写回 os.environ。
+_CLIENT_ENV = dict(os.environ)
+_HOME_OVERRIDE: str = _CLIENT_ENV.get("AGGREGATE_SEARCH_HOME", "").strip().strip("\"'")
 
 
 def _resolve_home() -> Path:
@@ -97,19 +105,23 @@ def legacy_file(name: str) -> Path | None:
 
 
 def _active(path: Path) -> tuple[Path, bool]:
-    """配置目录里有就用配置目录的；没有但旧位置还留着，就先兼容读旧的。"""
-    if file_exists(path):
+    """仅在新位置明确不存在时才回退旧配置；权限出错不能重新启用旧文件。"""
+    try:
+        path.stat()
+        return path, False
+    except FileNotFoundError:
+        pass
+    except OSError:
         return path, False
     legacy = legacy_file(path.name)
     return (legacy, True) if legacy else (path, False)
 
 
-# 实际读取的文件；*_IS_LEGACY 为真时启动日志和 web_status 会提示迁移
-ACTIVE_ENV_FILE, ENV_IS_LEGACY = _active(ENV_FILE)
-ACTIVE_KEYS_FILE, KEYS_IS_LEGACY = _active(KEYS_FILE)
+def active_files() -> tuple[tuple[Path, bool], tuple[Path, bool]]:
+    return _active(ENV_FILE), _active(KEYS_FILE)
 
 
-def _read_text(path: Path) -> str | None:
+def _read_text(path: Path, *, strict: bool = False) -> str | None:
     """读配置文本。Windows 上常见两种非 UTF-8 的情况也要认：
 
     - PowerShell 5 的 `echo ... > .env` 写出来是 UTF-16
@@ -118,8 +130,14 @@ def _read_text(path: Path) -> str | None:
     """
     try:
         raw = path.read_bytes()
+    except FileNotFoundError:
+        if not strict:
+            _warn(f"读不了 {path}：文件不存在")
+        return None
     except OSError as exc:
         _warn(f"读不了 {path}：{exc}")
+        if strict:
+            raise
         return None
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
         encodings = ["utf-16"]
@@ -132,7 +150,9 @@ def _read_text(path: Path) -> str | None:
             return raw.decode(encoding)
         except (UnicodeDecodeError, LookupError):
             continue
-    _warn(f"{path} 的编码无法识别，已忽略其中的全部配置。请用编辑器另存为 UTF-8。")
+    _warn(f"{path} 的编码无法识别，请用编辑器另存为 UTF-8。")
+    if strict:
+        raise OSError("配置文件编码无法识别")
     return None
 
 
@@ -164,20 +184,17 @@ def parse_dotenv(content: str) -> dict[str, str]:
     return values
 
 
-def _load_dotenv() -> None:
-    if not file_exists(ACTIVE_ENV_FILE):
-        return
-    content = _read_text(ACTIVE_ENV_FILE)
-    if content is None:
-        return
-    for name, value in parse_dotenv(content).items():
-        # 客户端传进来的环境变量优先；但传的是空串（配置模板里常见的占位）时不算数
-        if os.environ.get(name):
-            continue
-        try:
-            os.environ[name] = value
-        except (ValueError, OSError):
+def _load_dotenv(path: Path, *, strict: bool = False) -> dict[str, str]:
+    if not strict and not file_exists(path):
+        return {}
+    content = _read_text(path, strict=strict)
+    values = {}
+    for name, value in parse_dotenv(content or "").items():
+        if "\0" in value:
             _warn(f".env 里 {name} 的值含有非法字符，已忽略")
+        else:
+            values[name.upper() if os.name == "nt" else name] = value
+    return values
 
 
 def _strip_inline_comment(value: str) -> str:
@@ -226,8 +243,6 @@ def _unquote(value: str) -> str:
     return value
 
 
-_load_dotenv()
-
 _SPLIT = re.compile(r"[,\n;]+")
 
 # 每家 key 的候选环境变量名，靠前的优先（复数形式用于多 key）
@@ -262,41 +277,45 @@ def _split(raw: str) -> list[str]:
 _NONE_WORDS = ("none", "off", "-", "无")
 
 
-def _env_text(env_name: str, default: str = "") -> str:
+def _env_text(env_name: str, default: str = "", *, env=None) -> str:
     """读文本配置；没设置或留空都用默认值。"""
-    return os.environ.get(env_name, "").strip() or default
+    return (os.environ if env is None else env).get(env_name, "").strip() or default
 
 
-def _terms(env_name: str, default: str = "") -> list[str]:
+def _terms(env_name: str, default: str = "", *, env=None) -> list[str]:
     """读「列表」类配置（保留大小写）。留空 = 默认值；写 none = 空列表。"""
-    raw = os.environ.get(env_name, "").strip()
+    raw = (os.environ if env is None else env).get(env_name, "").strip()
     if raw.lower() in _NONE_WORDS:
         return []
     return list(dict.fromkeys(_split(raw or default)))
 
 
-def _names(env_name: str, default: str = "") -> list[str]:
+def _names(env_name: str, default: str = "", *, env=None) -> list[str]:
     """读「厂商名单」类配置：统一小写、去重、保序。写成 Tavily 或重复写两遍都不会出问题。"""
-    return list(dict.fromkeys(name.lower() for name in _terms(env_name, default)))
+    return list(dict.fromkeys(name.lower() for name in _terms(env_name, default, env=env)))
 
 
-def _load_keys_json() -> dict[str, list[str]]:
+def _load_keys_json(path: Path, *, strict: bool = False) -> dict[str, list[str]]:
     """可选：配置目录下 keys.json 集中管理多 key，格式 {"tavily": ["k1","k2"], ...}。
 
     环境变量里已经给了该家的 key 时，以环境变量为准（避免两份配置互相干扰）。
     """
-    if not file_exists(ACTIVE_KEYS_FILE):
+    if not strict and not file_exists(path):
         return {}
-    text = _read_text(ACTIVE_KEYS_FILE)
+    text = _read_text(path, strict=strict)
     if text is None:
         return {}
     try:
         data = json.loads(text)
-    except (ValueError, TypeError) as exc:
-        _warn(f"keys.json 不是合法的 JSON，已忽略：{exc}")
+    except (ValueError, TypeError):
+        _warn("keys.json 不是合法的 JSON")
+        if strict:
+            raise OSError("keys.json 无法解析") from None
         return {}
     if not isinstance(data, dict):
-        _warn("keys.json 最外层必须是 {…} 对象，已忽略")
+        _warn("keys.json 最外层必须是 {…} 对象")
+        if strict:
+            raise OSError("keys.json 结构错误")
         return {}
     result: dict[str, list[str]] = {}
     for name, value in data.items():
@@ -311,8 +330,6 @@ def _load_keys_json() -> dict[str, list[str]]:
     return result
 
 
-_JSON_KEYS = _load_keys_json()
-
 
 def _dedupe(keys: list[str]) -> list[str]:
     seen: set[str] = set()
@@ -324,204 +341,52 @@ def _dedupe(keys: list[str]) -> list[str]:
     return out
 
 
-def _keys_for(name: str) -> list[str]:
-    keys: list[str] = []
-    for env_name in _KEY_ENV_NAMES[name]:
-        keys.extend(_split(os.environ.get(env_name, "")))
-    keys = _dedupe(keys)
-    return keys or list(_JSON_KEYS.get(name, []))
+def _keys_for(name: str, dotenv: Mapping[str, str], json_keys: Mapping[str, list[str]]) -> tuple[str, ...]:
+    # 同一家厂商的不同别名也按来源分层，不能把文件里的旧 key 混进客户端的池。
+    for env in (_CLIENT_ENV, dotenv):
+        keys = _dedupe([key for alias in _KEY_ENV_NAMES[name] for key in _split(env.get(alias, ""))])
+        if keys:
+            return tuple(keys)
+    return tuple(_dedupe(json_keys.get(name, [])))
 
 
-# ---- 密钥：name -> [key1, key2, ...]，配置了哪家的 key 哪家就被启用 ----
-# 客户端（MCP 注册项）传进来的环境变量要在读 .env 之前拍个快照。
-# 热加载时先恢复这份快照再重新读 .env，才能保证「客户端 env > .env > keys.json」的优先级不被打乱。
-_CLIENT_ENV: dict[str, str] = {
-    name: os.environ[name]
-    for names in _KEY_ENV_NAMES.values() for name in names if os.environ.get(name)
-}
-_CLIENT_ENV.update({
-    name: value for name, value in os.environ.items()
-    if name in {
-        "SEARCH_MODE", "FREE_PROVIDERS", "PAID_PROVIDERS", "DOMESTIC_PROVIDERS", "GLOBAL_PROVIDERS",
-        "ESCALATE_EXCLUDE", "PROXY_PROVIDERS", "SEARCH_PROVIDERS", "DAILY_LIMITS", "MONTHLY_LIMITS",
-        "WEB_FETCH_PROVIDER", "UNVERIFIED_PROVIDERS", "SEARCH_PROXY", "SEARCH_PROXY_ALL",
-        "USE_SYSTEM_PROXY", "SEARCH_TIMEOUT", "TOTAL_TIMEOUT", "ENABLE_KEYLESS", "ADAPTIVE_ROUTING",
-        "REGION_ROUTING", "FETCH_CACHE_TTL", "FETCH_KEYED_FALLBACKS", "USAGE_LOG",
-    } and value
-})
-
-API_KEYS: dict[str, list[str]] = {name: _keys_for(name) for name in _KEY_ENV_NAMES}
-
-# ---- 自托管 / 可改写端点 ----
-# SearXNG 没有 key，靠实例地址启用
-SEARXNG_BASE_URL: str = os.environ.get("SEARXNG_BASE_URL", "").strip().rstrip("/")
-# Firecrawl 支持自托管，其余厂商一般不需要改
-FIRECRAWL_BASE_URL: str = _env_text("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/")
-
-# 可选：SEARCH_PROVIDERS=tavily,querit —— 限定 all 模式查哪几家（不影响第一阶段和补搜）
-SEARCH_PROVIDERS_LIMIT: list[str] | None = _names("SEARCH_PROVIDERS") or None
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
+def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name, "").strip().lower()
     if not raw:
         return default
     return raw in ("1", "true", "yes", "on")
 
 
-# 可选：HTTP 代理。SEARCH_PROXY 只给 PROXY_PROVIDERS 里的厂商用；
-# 设 SEARCH_PROXY_ALL=true 则所有厂商都走它。
-SEARCH_PROXY: str = os.environ.get("SEARCH_PROXY", "").strip()
-SEARCH_PROXY_ALL: bool = _env_bool("SEARCH_PROXY_ALL", False)
-# 这些源在实测中国内直连不稳；可按自己的网络情况用 PROXY_PROVIDERS 覆盖
-PROXY_PROVIDERS: set[str] = set(_names("PROXY_PROVIDERS", "jina,duckduckgo,youcom"))
-# 其余厂商怎么走：默认跟随系统的网络设置——系统开了代理（或设了 HTTP(S)_PROXY）就会经过它。
-# 设为 false 则强制直连，适合「代理开着全局模式、国内厂商被绕到境外节点」的情况。
-USE_SYSTEM_PROXY: bool = _env_bool("USE_SYSTEM_PROXY", True)
-
-# 免 key 来源是否默认参与聚合搜索。
-# Parallel / Keenable / AnySearch 匿名可用且实测稳定，始终默认启用。
-# DuckDuckGo 国内直连超时，Firecrawl 匿名与付费可能重复，因此这几家受开关控制。
-# 设置 ENABLE_KEYLESS=true 可启用全部免 key 源。
-ENABLE_KEYLESS: bool = _env_bool("ENABLE_KEYLESS", False)
-
-
-def _env_number(raw_name: str, default, cast, minimum=None):
-    """读取数值型配置；写错时回落到默认值并告警，不让 import 期崩溃。"""
-    raw = os.environ.get(raw_name)
+def _env_number(env: Mapping[str, str], name: str, default, cast, minimum=None):
+    """读取数值型配置；写错时回落到默认值并告警。"""
+    raw = env.get(name)
     if raw is None or raw.strip() == "":
         return default
     try:
         value = cast(raw.strip())
-        if not math.isfinite(value):  # nan / inf 能通过大小比较，必须单独挡掉
-            raise ValueError(raw)
+        if not math.isfinite(value):
+            raise ValueError
     except (TypeError, ValueError, OverflowError):
-        _warn(f"配置 {raw_name}={raw!r} 不是合法数值，已改用默认值 {default}")
+        _warn(f"配置 {name} 不是合法数值，已改用默认值 {default}")
         return default
     if minimum is not None and value < minimum:
-        _warn(f"配置 {raw_name}={value} 小于下限 {minimum}，已按 {minimum} 处理")
+        _warn(f"配置 {name}={value} 小于下限 {minimum}，已按 {minimum} 处理")
         return minimum
     return value
 
 
-# 可选：默认每家返回条数 / 单家超时秒数 / 抓取正文截断长度
-DEFAULT_MAX_RESULTS: int = _env_number("MAX_RESULTS", 5, int, minimum=1)
-SEARCH_TIMEOUT: float = _env_number("SEARCH_TIMEOUT", 15.0, float, minimum=1.0)
-FETCH_MAX_CHARS: int = _env_number("FETCH_MAX_CHARS", 20000, int, minimum=1000)
-
-# 一次搜索 / 抓取的总时限（秒）。到点就带着已经拿到的结果返回，不再等慢的厂商，也不再递补。
-# 很多 MCP 客户端的工具超时是 60 秒，一旦超时，已经搜到的结果会全部丢掉，所以默认留了余量。
-TOTAL_TIMEOUT: float = _env_number("TOTAL_TIMEOUT", 45.0, float, minimum=5.0)
-
-# 单家结果条数硬上限：各家 API 各有上限，统一卡在这里避免上游 400
-MAX_RESULTS_CAP: int = _env_number("MAX_RESULTS_CAP", 20, int, minimum=1)
-# 最终交付条数独立于每家抓取条数，避免 max_results=3 时只交付 6 条
-TOTAL_RESULTS: int = _env_number("TOTAL_RESULTS", 12, int, minimum=1)
-NEAR_DEDUP: bool = _env_bool("NEAR_DEDUP", True)
-
-# ---- 抓取 ----
-# 默认免费优先：先用匿名可用的 parallel / keenable，失败再用带 key 的后端。
-# WEB_FETCH_PROVIDER=tavily（或 jina,tavily）可把指定后端排到最前。
-FETCH_PREFERRED: list[str] = _names("WEB_FETCH_PROVIDER")
-# 正文短于这个长度视为“可能没抓全”（反爬页 / 空壳页），会再换一个后端试一次；0 关闭。
-FETCH_MIN_CHARS: int = _env_number("FETCH_MIN_CHARS", 200, int, minimum=0)
-# 同一个网址在这么多秒内重复抓取，直接返回缓存（0 = 不缓存）。
-# 一次搜索里多条结果指向同一个页面、或 Agent 连续追问同一页时，能省掉重复的额度。
-FETCH_CACHE_TTL: int = _env_number("FETCH_CACHE_TTL", 300, int, minimum=0)
-# 免费后端都失败后，最多再试几个带 key 的后端。地址本身打不开时，没必要把每家的额度都试一遍。
-FETCH_KEYED_FALLBACKS: int = _env_number("FETCH_KEYED_FALLBACKS", 2, int, minimum=0)
-
-# 搜索成本控制：auto 先查匿名源，质量不足才有限启用带 key 的源。
-# 这些阈值只做第一道确定性门禁；最终语义是否充足由当前 Agent 结合证据判断。
-#   auto      匿名优先，本地门禁不足才自动补搜
-#   free      只做匿名调用，绝不发送账号 key
-#   escalate  跳过匿名阶段，直接补几个不同厂商（供 Agent 判断不够时调用）
-#   all       全部已启用厂商
-SEARCH_MODES: tuple[str, ...] = ("auto", "free", "escalate", "all")
-SEARCH_MODE: str = os.environ.get("SEARCH_MODE", "auto").strip().lower() or "auto"
-if SEARCH_MODE not in SEARCH_MODES:
-    _warn(f"配置 SEARCH_MODE={SEARCH_MODE!r} 无法识别（可选 {' / '.join(SEARCH_MODES)}），已按 auto 处理")
-    SEARCH_MODE = "auto"
-# 第一阶段的匿名源：默认不带 key 调用，即使配了它们的 key（例外见下面的 ANON_KEY_FALLBACK）。
-FREE_PROVIDERS: list[str] = _names("FREE_PROVIDERS", "parallel,keenable,anysearch")
-# 匿名通道被限流 / 拒绝时，如果配了那一家的 key，auto 模式就改用 key 再试一次（free 模式永远不会）。
-# 设为 false 则第一阶段严格匿名：被限流的那家本轮直接算失败。
-ANON_KEY_FALLBACK: bool = _env_bool("ANON_KEY_FALLBACK", True)
-# 通用补搜顺序。名单里没写、但配了 key 的厂商会自动排在最后，不会被漏掉。
-# 排序原则：**作者实测过的排前面**，按文档接入但没实测过的排后面——
-# 未实测不等于不能用，配了 key 照样会轮到你，只是排在后面，先给稳的那些机会。
-# 末尾三家是匿名源的“带 key 版”：同一问题的匿名结果已经有了就不会再选它们。
-PAID_PROVIDERS: list[str] = _names(
-    "PAID_PROVIDERS",
-    # 已实测
-    "volcengine,querit,tavily,exa,firecrawl,jina,baidu,"
-    # 未实测（按文档接入，没有真实调用验证过）
-    "yuanbao,zhipu,bocha,brave,ollama,youcom,"
-    # 匿名源的带 key 版
-    "parallel,keenable,anysearch",
-)
-# 没有经过真实调用验证的厂商：只在状态页标注、补搜时排到后面，**不禁用**。
-UNVERIFIED_PROVIDERS: set[str] = set(_names(
-    "UNVERIFIED_PROVIDERS", "yuanbao,zhipu,bocha,brave,ollama,youcom,perplexity,searxng"
-))
-# 自适应路由：按近 7 天的实际表现微调补搜顺序（只在本组内调整，绝不跨区、不永久剔除）。
-# 关掉它就完全按静态名单排序。
-ADAPTIVE_ROUTING: bool = _env_bool("ADAPTIVE_ROUTING", True)
-# 某家至少要有这么多次真实调用，才允许参与调权（避免几次偶然失败就把好厂商压下去）。
-ADAPTIVE_MIN_CALLS: int = _env_number("ADAPTIVE_MIN_CALLS", 5, int, minimum=1)
-# 成功率低于这个值才降权；高于 0.95 且调用够多的略微提权。
-ADAPTIVE_BAD_RATE: float = _env_number("ADAPTIVE_BAD_RATE", 0.6, float, minimum=0.0)
-ADAPTIVE_GOOD_RATE: float = _env_number("ADAPTIVE_GOOD_RATE", 0.95, float, minimum=0.0)
-# 不参与自动补搜的厂商（仍可用 providers 点名，all 模式也照常包含）。
-# Perplexity 每次搜索是一次大模型调用，比普通搜索贵得多，默认不自动动用。
-ESCALATE_EXCLUDE: set[str] = set(_names("ESCALATE_EXCLUDE", "perplexity"))
-# 地区只影响第二阶段补源顺序，不过滤第一阶段或最终结果中的跨地区信息。
-# auto：根据问题中的地域实体选择；off：沿用 PAID_PROVIDERS；cn/global：手动指定。
-REGION_ROUTING: str = _env_text("REGION_ROUTING", "auto").lower()
-DOMESTIC_PROVIDERS: list[str] = _names(
-    "DOMESTIC_PROVIDERS", "baidu,volcengine,querit,yuanbao,zhipu,bocha"
-)
-GLOBAL_PROVIDERS: list[str] = _names("GLOBAL_PROVIDERS", "tavily,exa,firecrawl,jina")
-# 只把明确的地域实体作为信号，不能把中文提问等同于国内信息。
-DOMESTIC_QUERY_TERMS: list[str] = _terms(
-    "DOMESTIC_QUERY_TERMS",
-    "中国,国内,大陆,中美,北京,上海,广州,深圳,杭州,成都,重庆,武汉,西安,南京,天津,苏州,国务院,工信部,发改委,国产,人民币,沪深,A股,微信,支付宝,淘宝,天猫,京东,抖音,快手,B站,哔哩哔哩,知乎,小红书,百度,阿里,腾讯,字节跳动,华为,小米,比亚迪,宁德时代",
-)
-GLOBAL_QUERY_TERMS: list[str] = _terms(
-    "GLOBAL_QUERY_TERMS",
-    "美国,中美,英国,加拿大,欧洲,欧盟,日本,韩国,新加坡,印度,澳大利亚,俄罗斯,美元,美股,纳斯达克,硅谷,OpenAI,Anthropic,Google,Microsoft,Meta,NVIDIA,Apple,Amazon,Tesla,GitHub,Linux,Kubernetes,Docker,React,Vue,Python,Java,Rust,Go,Node.js,AWS,Azure,GCP,Cloudflare",
-)
-# 英文短词当地域信号容易误判：query 里写 "how to go back" 不该被当成 Go 语言。
-# 这里的词在 routing 里必须区分大小写，并且紧跟版本号 / 语言名 / 常见搭配才算命中。
-CASE_SENSITIVE_QUERY_TERMS: set[str] = {"go"}
-# auto 模式门禁不足时自动追加的不同厂商数；设 0 关闭自动补搜，完全交给 Agent 用 escalate 决定。
-AUTO_ESCALATE_MAX: int = _env_number("AUTO_ESCALATE_MAX", 3, int, minimum=0)
-# escalate 模式每次追加的不同厂商数。
-ESCALATE_COUNT: int = _env_number("ESCALATE_COUNT", 3, int, minimum=1)
-AUTO_MIN_RESULTS: int = _env_number("AUTO_MIN_RESULTS", 4, int, minimum=1)
-AUTO_MIN_UNIQUE: int = _env_number("AUTO_MIN_UNIQUE", 3, int, minimum=1)
-AUTO_MIN_CONSENSUS: int = _env_number("AUTO_MIN_CONSENSUS", 1, int, minimum=0)
-# 官方一手事实源可作为三源共识的替代证据，只用于政策/价格/文档类查询。
-# 域名是提示而非事实证明，Agent 仍需审核页面内容和时间。
-OFFICIAL_SOURCE_DOMAINS: list[str] = _terms(
-    "OFFICIAL_SOURCE_DOMAINS",
-    "gov.cn,miit.gov.cn,ndrc.gov.cn,openai.com,developers.openai.com,platform.openai.com,anthropic.com,modelcontextprotocol.io,kubernetes.io,learn.microsoft.com,cloud.google.com,docs.python.org,developer.mozilla.org",
-)
-# 含比较、最新、价格、政策、多实体等语义时提高门禁，不能仅凭结果数量直接交付。
-COMPLEX_QUERY_PATTERNS: list[str] = _terms(
-    "COMPLEX_QUERY_PATTERNS",
-    "对比,比较,区别,哪个好,最新,今天,近期,价格,政策,法规,风险,评测,深度,分析,vs,versus,compare,latest,pricing",
-)
+SEARCH_MODES = ("auto", "free", "escalate", "all")
+# 英文短词得区分大小写，并配合上下文，避免把 "how to go back" 当作 Go 语言。
+CASE_SENSITIVE_QUERY_TERMS = frozenset({"go"})
 
 
-# ---- HTTP 传输（只有用 --transport streamable-http 时才相关）----
-# 服务鉴权 Token。绑定非回环地址（对外开放）时**必须**配置，否则拒绝启动——
-# 不带鉴权的搜索服务相当于把本机的 key 和额度开放给整个局域网。
-MCP_HTTP_TOKEN: str = os.environ.get("MCP_HTTP_TOKEN", "").strip()
+def _effective_env(dotenv: dict[str, str]) -> dict[str, str]:
+    # 空串是注册模板里的占位，保持以往的回落行为。
+    return {**dotenv, **{name: value for name, value in _CLIENT_ENV.items() if value.strip()}}
 
-# ---- 状态与记录文件：默认都在配置目录里，相对路径也挂到配置目录 ----
-def _state_path(env_name: str, default_name: str) -> Path:
-    raw = os.environ.get(env_name, "").strip()
+
+def _state_path(env: Mapping[str, str], env_name: str, default_name: str) -> Path:
+    raw = env.get(env_name, "").strip()
     if not raw:
         return CONFIG_DIR / default_name
     path = Path(os.path.expandvars(raw)).expanduser()
@@ -535,19 +400,6 @@ def _state_path(env_name: str, default_name: str) -> Path:
     return CONFIG_DIR / path
 
 
-# key 限额状态（只存 key 的哈希和状态，不存 key 本身）
-KEY_STATE_FILE: Path = _state_path("KEY_STATE_FILE", "key-state.json")
-# 额度耗尽 / 限流时的默认冷却秒数（上游没给 Retry-After 时使用）
-QUOTA_COOLDOWN: int = _env_number("QUOTA_COOLDOWN", 3600, int, minimum=1)
-RATE_COOLDOWN: int = _env_number("RATE_COOLDOWN", 60, int, minimum=1)
-
-# 本地使用记录：每次搜索 / 抓取一行，只写在本机配置目录
-USAGE_LOG: bool = _env_bool("USAGE_LOG", True)
-USAGE_LOG_FILE: Path = _state_path("USAGE_LOG_FILE", "usage.jsonl")
-USAGE_LOG_MAX_MB: float = _env_number("USAGE_LOG_MAX_MB", 5.0, float, minimum=0.1)
-USAGE_COUNTER_FILE: Path = _state_path("USAGE_COUNTER_FILE", "usage-counters.json")
-
-
 def _parse_limits(raw: str, env_name: str) -> dict[str, int]:
     """`baidu:90,tavily:30` -> {"baidu": 90, "tavily": 30}；0 表示不限。"""
     limits: dict[str, int] = {}
@@ -558,23 +410,165 @@ def _parse_limits(raw: str, env_name: str) -> dict[str, int]:
             number = int(value.strip())
         except ValueError:
             number = -1
-        if not sep or not name or number < 0:
-            _warn(f"配置 {env_name} 里的 {part!r} 无法识别（应为 厂商:次数，如 baidu:90），已忽略")
+        if not sep or name not in _KNOWN_PROVIDERS or number < 0:
+            _warn(f"配置 {env_name} 中有条目无法识别（应为 厂商:次数，如 baidu:90），已忽略")
             continue
         limits[name] = number
     return limits
 
 
-# 每个 key 每天 / 每月最多发出多少次请求，到量就当它不可用，直到下一天 / 下个月。
-# 百度千帆超出每日免费额度后会按量计费，所以内置一个留了余量的默认值；
-# 其它家默认不限。写 `厂商:0` 可取消某家的上限。
-DAILY_LIMITS: dict[str, int] = {
-    "baidu": 90,
-    **_parse_limits(os.environ.get("DAILY_LIMITS", ""), "DAILY_LIMITS"),
-}
-MONTHLY_LIMITS: dict[str, int] = _parse_limits(
-    os.environ.get("MONTHLY_LIMITS", ""), "MONTHLY_LIMITS"
-)
+@dataclass(frozen=True)
+class RuntimeSettings:
+    """一次工具调用看到的配置。可变容器在发布快照前转成只读值。"""
+
+    revision: int
+    API_KEYS: Mapping[str, tuple[str, ...]] = field(repr=False)
+    SEARXNG_BASE_URL: str
+    FIRECRAWL_BASE_URL: str
+    SEARCH_PROVIDERS_LIMIT: tuple[str, ...]
+    SEARCH_PROXY: str = field(repr=False)
+    SEARCH_PROXY_ALL: bool
+    PROXY_PROVIDERS: frozenset[str]
+    USE_SYSTEM_PROXY: bool
+    ENABLE_KEYLESS: bool
+    DEFAULT_MAX_RESULTS: int
+    SEARCH_TIMEOUT: float
+    FETCH_MAX_CHARS: int
+    TOTAL_TIMEOUT: float
+    MAX_RESULTS_CAP: int
+    TOTAL_RESULTS: int
+    NEAR_DEDUP: bool
+    FETCH_PREFERRED: tuple[str, ...]
+    FETCH_MIN_CHARS: int
+    FETCH_CACHE_TTL: int
+    FETCH_KEYED_FALLBACKS: int
+    SEARCH_MODE: str
+    SEARCH_NO_ACCOUNT_KEYS: bool
+    FREE_PROVIDERS: tuple[str, ...]
+    ANON_KEY_FALLBACK: bool
+    PAID_PROVIDERS: tuple[str, ...]
+    UNVERIFIED_PROVIDERS: frozenset[str]
+    ADAPTIVE_ROUTING: bool
+    ADAPTIVE_MIN_CALLS: int
+    ADAPTIVE_BAD_RATE: float
+    ADAPTIVE_GOOD_RATE: float
+    ESCALATE_EXCLUDE: frozenset[str]
+    REGION_ROUTING: str
+    DOMESTIC_PROVIDERS: tuple[str, ...]
+    GLOBAL_PROVIDERS: tuple[str, ...]
+    DOMESTIC_QUERY_TERMS: tuple[str, ...]
+    GLOBAL_QUERY_TERMS: tuple[str, ...]
+    AUTO_ESCALATE_MAX: int
+    ESCALATE_COUNT: int
+    AUTO_MIN_RESULTS: int
+    AUTO_MIN_UNIQUE: int
+    AUTO_MIN_CONSENSUS: int
+    OFFICIAL_SOURCE_DOMAINS: tuple[str, ...]
+    COMPLEX_QUERY_PATTERNS: tuple[str, ...]
+    QUOTA_COOLDOWN: int
+    RATE_COOLDOWN: int
+    USAGE_LOG: bool
+    USAGE_LOG_MAX_MB: float
+    DAILY_LIMITS: Mapping[str, int]
+    MONTHLY_LIMITS: Mapping[str, int]
+
+    @cached_property
+    def secrets(self) -> tuple[str, ...]:
+        secrets = {key for keys in self.API_KEYS.values() for key in keys}
+        if MCP_HTTP_TOKEN:
+            secrets.add(MCP_HTTP_TOKEN)
+        return tuple(sorted(secrets, key=len, reverse=True))
+
+
+def _build_settings(
+    dotenv: dict[str, str], json_keys: dict[str, list[str]], revision: int,
+    previous: RuntimeSettings | None = None,
+) -> RuntimeSettings:
+    env = _effective_env(dotenv)
+    text = partial(_env_text, env=env)
+    terms = partial(_terms, env=env)
+    names = partial(_names, env=env)
+    flag = partial(_env_bool, env)
+    number = partial(_env_number, env)
+    mode = text("SEARCH_MODE", "auto").lower()
+    if mode not in SEARCH_MODES:
+        _warn(f"配置 SEARCH_MODE 无法识别（可选 {' / '.join(SEARCH_MODES)}），已按 auto 处理")
+        mode = "auto"
+    raw_lock = text("SEARCH_NO_ACCOUNT_KEYS").lower()
+    if raw_lock in ("0", "false", "no", "off"):
+        locked = False
+    elif raw_lock or (previous and previous.SEARCH_NO_ACCOUNT_KEYS):
+        if raw_lock not in ("1", "true", "yes", "on"):
+            _warn("SEARCH_NO_ACCOUNT_KEYS 继续禁止账号 key；要解除请明确设置 false")
+        locked = True
+    else:
+        locked = False
+
+    def limits(name: str, defaults: dict[str, int]) -> Mapping[str, int]:
+        if previous is not None:
+            # 保存中途没有读到某厂商的额度配置，不应把有效上限放宽。显式写 厂商:0 取消。
+            defaults = {**defaults, **getattr(previous, name)}
+        return MappingProxyType({**defaults, **_parse_limits(text(name), name)})
+
+    return RuntimeSettings(
+        revision=revision,
+        API_KEYS=MappingProxyType({name: _keys_for(name, dotenv, json_keys) for name in _KEY_ENV_NAMES}),
+        SEARXNG_BASE_URL=text("SEARXNG_BASE_URL").rstrip("/"),
+        FIRECRAWL_BASE_URL=text("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/"),
+        SEARCH_PROVIDERS_LIMIT=tuple(names("SEARCH_PROVIDERS")),
+        SEARCH_PROXY=text("SEARCH_PROXY"),
+        SEARCH_PROXY_ALL=flag("SEARCH_PROXY_ALL", False),
+        PROXY_PROVIDERS=frozenset(names("PROXY_PROVIDERS", "jina,duckduckgo,youcom")),
+        USE_SYSTEM_PROXY=flag("USE_SYSTEM_PROXY", True),
+        ENABLE_KEYLESS=flag("ENABLE_KEYLESS", False),
+        DEFAULT_MAX_RESULTS=number("MAX_RESULTS", 5, int, minimum=1),
+        SEARCH_TIMEOUT=number("SEARCH_TIMEOUT", 15.0, float, minimum=1.0),
+        FETCH_MAX_CHARS=number("FETCH_MAX_CHARS", 20000, int, minimum=1000),
+        TOTAL_TIMEOUT=number("TOTAL_TIMEOUT", 45.0, float, minimum=5.0),
+        MAX_RESULTS_CAP=number("MAX_RESULTS_CAP", 20, int, minimum=1),
+        TOTAL_RESULTS=number("TOTAL_RESULTS", 12, int, minimum=1),
+        NEAR_DEDUP=flag("NEAR_DEDUP", True),
+        FETCH_PREFERRED=tuple(names("WEB_FETCH_PROVIDER")),
+        FETCH_MIN_CHARS=number("FETCH_MIN_CHARS", 200, int, minimum=0),
+        FETCH_CACHE_TTL=number("FETCH_CACHE_TTL", 300, int, minimum=0),
+        FETCH_KEYED_FALLBACKS=number("FETCH_KEYED_FALLBACKS", 2, int, minimum=0),
+        SEARCH_MODE=mode,
+        SEARCH_NO_ACCOUNT_KEYS=locked,
+        FREE_PROVIDERS=tuple(names("FREE_PROVIDERS", "parallel,keenable,anysearch")),
+        ANON_KEY_FALLBACK=flag("ANON_KEY_FALLBACK", True),
+        PAID_PROVIDERS=tuple(names(
+            "PAID_PROVIDERS",
+            "volcengine,querit,tavily,exa,firecrawl,jina,baidu,"
+            "yuanbao,zhipu,bocha,brave,ollama,youcom,parallel,keenable,anysearch",
+        )),
+        UNVERIFIED_PROVIDERS=frozenset(names(
+            "UNVERIFIED_PROVIDERS", "yuanbao,zhipu,bocha,brave,ollama,youcom,perplexity,searxng",
+        )),
+        ADAPTIVE_ROUTING=flag("ADAPTIVE_ROUTING", True),
+        ADAPTIVE_MIN_CALLS=number("ADAPTIVE_MIN_CALLS", 5, int, minimum=1),
+        ADAPTIVE_BAD_RATE=number("ADAPTIVE_BAD_RATE", 0.6, float, minimum=0.0),
+        ADAPTIVE_GOOD_RATE=number("ADAPTIVE_GOOD_RATE", 0.95, float, minimum=0.0),
+        ESCALATE_EXCLUDE=frozenset(names("ESCALATE_EXCLUDE", "perplexity")),
+        REGION_ROUTING=text("REGION_ROUTING", "auto").lower(),
+        DOMESTIC_PROVIDERS=tuple(names("DOMESTIC_PROVIDERS", "baidu,volcengine,querit,yuanbao,zhipu,bocha")),
+        GLOBAL_PROVIDERS=tuple(names("GLOBAL_PROVIDERS", "tavily,exa,firecrawl,jina")),
+        DOMESTIC_QUERY_TERMS=tuple(terms("DOMESTIC_QUERY_TERMS", "中国,国内,大陆,中美,北京,上海,广州,深圳,杭州,成都,重庆,武汉,西安,南京,天津,苏州,国务院,工信部,发改委,国产,人民币,沪深,A股,微信,支付宝,淘宝,天猫,京东,抖音,快手,B站,哔哩哔哩,知乎,小红书,百度,阿里,腾讯,字节跳动,华为,小米,比亚迪,宁德时代")),
+        GLOBAL_QUERY_TERMS=tuple(terms("GLOBAL_QUERY_TERMS", "美国,中美,英国,加拿大,欧洲,欧盟,日本,韩国,新加坡,印度,澳大利亚,俄罗斯,美元,美股,纳斯达克,硅谷,OpenAI,Anthropic,Google,Microsoft,Meta,NVIDIA,Apple,Amazon,Tesla,GitHub,Linux,Kubernetes,Docker,React,Vue,Python,Java,Rust,Go,Node.js,AWS,Azure,GCP,Cloudflare")),
+        AUTO_ESCALATE_MAX=number("AUTO_ESCALATE_MAX", 3, int, minimum=0),
+        ESCALATE_COUNT=number("ESCALATE_COUNT", 3, int, minimum=1),
+        AUTO_MIN_RESULTS=number("AUTO_MIN_RESULTS", 4, int, minimum=1),
+        AUTO_MIN_UNIQUE=number("AUTO_MIN_UNIQUE", 3, int, minimum=1),
+        AUTO_MIN_CONSENSUS=number("AUTO_MIN_CONSENSUS", 1, int, minimum=0),
+        OFFICIAL_SOURCE_DOMAINS=tuple(terms("OFFICIAL_SOURCE_DOMAINS", "gov.cn,miit.gov.cn,ndrc.gov.cn,openai.com,developers.openai.com,platform.openai.com,anthropic.com,modelcontextprotocol.io,kubernetes.io,learn.microsoft.com,cloud.google.com,docs.python.org,developer.mozilla.org")),
+        COMPLEX_QUERY_PATTERNS=tuple(terms("COMPLEX_QUERY_PATTERNS", "对比,比较,区别,哪个好,最新,今天,近期,价格,政策,法规,风险,评测,深度,分析,vs,versus,compare,latest,pricing")),
+        QUOTA_COOLDOWN=number("QUOTA_COOLDOWN", 3600, int, minimum=1),
+        RATE_COOLDOWN=number("RATE_COOLDOWN", 60, int, minimum=1),
+        USAGE_LOG=flag("USAGE_LOG", True),
+        USAGE_LOG_MAX_MB=number("USAGE_LOG_MAX_MB", 5.0, float, minimum=0.1),
+        # 百度超出免费额度后按量计费，内置一个留了余量的默认上限。
+        DAILY_LIMITS=limits("DAILY_LIMITS", {"baidu": 90}),
+        MONTHLY_LIMITS=limits("MONTHLY_LIMITS", {}),
+    )
 
 
 # ---- 厂商名拼写校验 ----
@@ -583,10 +577,11 @@ MONTHLY_LIMITS: dict[str, int] = _parse_limits(
 _KNOWN_PROVIDERS: frozenset[str] = frozenset(_KEY_ENV_NAMES) | {"duckduckgo", "searxng", "firecrawl"}
 
 
-def check_provider_names() -> list[str]:
+def check_provider_names(settings: RuntimeSettings | None = None, json_keys=None) -> list[str]:
     """检查各配置项里的厂商名是否拼对，返回问题描述（同时写进 WARNINGS）。"""
+    settings = settings if settings is not None else get_settings()
+    json_keys = _JSON_KEYS if json_keys is None else json_keys
     problems: list[str] = []
-    seen: set[str] = set()
 
     def check_list(label: str, names, extra: frozenset[str] = frozenset()) -> None:
         unknown = [name for name in names if name and name not in _KNOWN_PROVIDERS | extra]
@@ -596,120 +591,141 @@ def check_provider_names() -> list[str]:
         problems.append(message)
 
     for label, names in (
-        ("FREE_PROVIDERS", FREE_PROVIDERS),
-        ("PAID_PROVIDERS", PAID_PROVIDERS),
-        ("DOMESTIC_PROVIDERS", DOMESTIC_PROVIDERS),
-        ("GLOBAL_PROVIDERS", GLOBAL_PROVIDERS),
-        ("ESCALATE_EXCLUDE", sorted(ESCALATE_EXCLUDE)),
-        ("PROXY_PROVIDERS", sorted(PROXY_PROVIDERS)),
-        ("SEARCH_PROVIDERS", SEARCH_PROVIDERS_LIMIT or []),
+        ("FREE_PROVIDERS", settings.FREE_PROVIDERS),
+        ("PAID_PROVIDERS", settings.PAID_PROVIDERS),
+        ("DOMESTIC_PROVIDERS", settings.DOMESTIC_PROVIDERS),
+        ("GLOBAL_PROVIDERS", settings.GLOBAL_PROVIDERS),
+        ("ESCALATE_EXCLUDE", sorted(settings.ESCALATE_EXCLUDE)),
+        ("PROXY_PROVIDERS", sorted(settings.PROXY_PROVIDERS)),
+        ("SEARCH_PROVIDERS", settings.SEARCH_PROVIDERS_LIMIT or []),
     ):
         check_list(label, names)
-    for label, limits in (("DAILY_LIMITS", DAILY_LIMITS), ("MONTHLY_LIMITS", MONTHLY_LIMITS)):
+    for label, limits in (("DAILY_LIMITS", settings.DAILY_LIMITS), ("MONTHLY_LIMITS", settings.MONTHLY_LIMITS)):
         check_list(label, list(limits))
     # 抓取后端只允许真正支持抓取的那几家
     fetch_names = {"tavily", "keenable", "firecrawl", "ollama", "exa", "jina", "parallel"}
-    bad_fetch = [name for name in FETCH_PREFERRED if name and name not in fetch_names]
+    bad_fetch = [name for name in settings.FETCH_PREFERRED if name and name not in fetch_names]
     if bad_fetch:
         problems.append(
             f"配置 WEB_FETCH_PROVIDER 里的厂商不支持抓取：{', '.join(sorted(set(bad_fetch)))}"
             f"（可选：{', '.join(sorted(fetch_names))}）"
         )
     # keys.json 里写了不存在的厂商，多半也是拼错了
-    bad_json = [name for name in _JSON_KEYS if name not in _KNOWN_PROVIDERS]
+    bad_json = [name for name in json_keys if name not in _KNOWN_PROVIDERS]
     if bad_json:
         problems.append(f"keys.json 里的厂商标识无法识别：{', '.join(sorted(set(bad_json)))}（拼写有误？）")
 
-    for message in problems:
-        if message not in seen:
-            seen.add(message)
-            _warn(message)
+    for message in dict.fromkeys(problems):
+        _warn(message)
     return problems
 
+# ---- 配置快照与热加载 ----
 
-check_provider_names()
-
-
-# ---------------------------------------------------------------------------
-# 热加载：改了 .env / keys.json 之后，不用重启 MCP 服务就生效
-#
-# 只重载「改完希望马上生效」的东西：各家 key、以及依托 key 的一切派生配置。
-# AGGREGATE_SEARCH_HOME 这类目录级路径保持启动期的值——运行期换目录会让状态文件
-# 和用量记录散落到两个地方，得不偿失。
-# ---------------------------------------------------------------------------
-
-# 热加载会重新读取的环境变量名：各家的 key 变量 + 运行时开关
-_RELOADABLE_ENV: frozenset[str] = frozenset(
-    [env_name for names in _KEY_ENV_NAMES.values() for env_name in names]
-    + [
-        "SEARCH_MODE", "FREE_PROVIDERS", "PAID_PROVIDERS", "DOMESTIC_PROVIDERS",
-        "GLOBAL_PROVIDERS", "ESCALATE_EXCLUDE", "PROXY_PROVIDERS", "SEARCH_PROVIDERS",
-        "DAILY_LIMITS", "MONTHLY_LIMITS", "WEB_FETCH_PROVIDER", "UNVERIFIED_PROVIDERS",
-        "SEARCH_PROXY", "SEARCH_PROXY_ALL", "USE_SYSTEM_PROXY", "SEARCH_TIMEOUT",
-        "TOTAL_TIMEOUT", "ENABLE_KEYLESS", "ADAPTIVE_ROUTING", "REGION_ROUTING",
-        "FETCH_CACHE_TTL", "FETCH_KEYED_FALLBACKS", "USAGE_LOG",
-    ]
-)
-
-_ENV_SIGNATURE: tuple = ()
+_SETTINGS_LOCK = threading.RLock()
+_REQUEST_SETTINGS: ContextVar[RuntimeSettings | None] = ContextVar("aggregate_search_config", default=None)
 
 
-def _files_signature() -> tuple:
-    """两个配置文件的 (路径, mtime, 大小)。没有文件时记 None。"""
-    items = []
-    for path in (ACTIVE_ENV_FILE, ACTIVE_KEYS_FILE):
-        try:
-            stat = path.stat()
-            items.append((str(path), stat.st_mtime_ns, stat.st_size))
-        except OSError:
-            items.append((str(path), None, None))
-    return tuple(items)
+def _file_signature(path: Path) -> tuple:
+    """同时识别原地保存、原子替换、新建或删除。"""
+    try:
+        stat = path.stat()
+        return str(path), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino
+    except FileNotFoundError:
+        return (str(path),)
 
 
-def mark_loaded() -> None:
-    """记住当前配置文件的指纹（启动时调用一次）。"""
-    global _ENV_SIGNATURE
-    _ENV_SIGNATURE = _files_signature()
+def _read_source(path: Path, read, previous_signature, previous_values):
+    """正在保存或暂不可读时，保留该文件上一份配置；另一个文件仍可更新。"""
+    try:
+        signature = _file_signature(path)
+        if signature == previous_signature:
+            return previous_signature, previous_values
+        values = read(path, strict=True)
+        if signature == _file_signature(path):
+            return signature, values
+    except OSError:
+        pass
+    return previous_signature, previous_values
+
+
+def get_live_settings() -> RuntimeSettings:
+    return _SETTINGS
+
+
+def get_settings() -> RuntimeSettings:
+    return _REQUEST_SETTINGS.get() or _SETTINGS
+
+
+def force_anonymous() -> bool:
+    """服务端硬锁。已在途的请求可以结束，但不能在硬锁开启后重试账号 key。"""
+    return _ENV_SIGNATURE is None or _SETTINGS.SEARCH_NO_ACCOUNT_KEYS or get_settings().SEARCH_NO_ACCOUNT_KEYS
+
+
+def redaction_secrets() -> tuple[str, ...]:
+    # 在途旧配置的凭据也要遮盖。HTTP Token 随监听进程启动固定。
+    current, live = get_settings(), _SETTINGS
+    if current is live:
+        return live.secrets
+    return tuple(sorted(set(current.secrets) | set(live.secrets), key=len, reverse=True))
 
 
 def reload_if_changed() -> bool:
-    """配置文件变了就重新读一遍。返回 True 表示发生了重载。
+    """在工具调用前刷新文件。目录、日志路径和入站 HTTP 鉴权保持启动值。"""
+    global _ENV_SIGNATURE, _KEYS_SIGNATURE, _DOTENV, _JSON_KEYS, _SETTINGS
+    with _SETTINGS_LOCK:
+        (env_file, _), (keys_file, _) = active_files()
+        try:
+            unchanged = _file_signature(env_file) == _ENV_SIGNATURE and _file_signature(keys_file) == _KEYS_SIGNATURE
+        except OSError:
+            unchanged = False
+        if unchanged:
+            return False
+        WARNINGS.clear()
+        env_signature, dotenv = _read_source(env_file, _load_dotenv, _ENV_SIGNATURE, _DOTENV)
+        keys_signature, keys = _read_source(keys_file, _load_keys_json, _KEYS_SIGNATURE, _JSON_KEYS)
+        if env_signature == _ENV_SIGNATURE and keys_signature == _KEYS_SIGNATURE:
+            return False
+        settings = _build_settings(dotenv, keys, _SETTINGS.revision + 1, _SETTINGS)
+        check_provider_names(settings, keys)
+        _ENV_SIGNATURE, _KEYS_SIGNATURE, _DOTENV, _JSON_KEYS, _SETTINGS = env_signature, keys_signature, dotenv, keys, settings
+        log("配置文件已重新加载" + ("（有配置被跳过，见上方告警）" if WARNINGS else "（运行配置即时生效）"))
+        return True
 
-    - 只刷新 key 相关配置与派生名单，不动目录级路径
-    - 单行写错照样跳过并告警，不会崩、也不会把密钥打进日志
-    - 客户端传入的环境变量始终优先（重载前先恢复基线）
-    """
-    global _ENV_SIGNATURE, API_KEYS, _JSON_KEYS
-    signature = _files_signature()
-    if signature == _ENV_SIGNATURE:
-        return False
-    _ENV_SIGNATURE = signature
 
-    warnings_before = len(WARNINGS)
-    # 1) 把上次由 .env 写进 os.environ 的值清掉，恢复到「客户端 env」基线。
-    #    注意要比对环境变量名（TAVILY_API_KEYS），不是厂商名（tavily）。
-    for name in _RELOADABLE_ENV:
-        os.environ.pop(name, None)
-    for name, value in _CLIENT_ENV.items():
-        os.environ[name] = value
-
-    # 2) 重新读 .env 与 keys.json
-    _load_dotenv()
-    _JSON_KEYS = _load_keys_json()
-    API_KEYS = {name: _keys_for(name) for name in _KEY_ENV_NAMES}
-
-    # 3) 就地刷新各 provider 的 key 池（保留还存在的 key 的轮转位置）
+@contextmanager
+def use_settings(**overrides):
+    """固定当前请求的配置；自测可按调用覆盖单个字段。"""
+    settings = _REQUEST_SETTINGS.get()
+    if settings is None:
+        reload_if_changed()
+        settings = _SETTINGS
+    if overrides:
+        settings = replace(settings, **overrides)
+    token = _REQUEST_SETTINGS.set(settings)
     try:
-        from .providers import refresh_pools
-        refresh_pools(API_KEYS)
-    except Exception as exc:  # 循环导入或 provider 层出问题时，至少 key 字典已更新
-        _warn(f"热加载时刷新 key 池失败：{exc}")
-
-    if len(WARNINGS) > warnings_before:
-        log("配置文件已重新加载，但有部分内容有问题（见上方告警）")
-    else:
-        log("配置文件已重新加载（改动即时生效）")
-    return True
+        yield settings
+    finally:
+        _REQUEST_SETTINGS.reset(token)
 
 
-mark_loaded()
+def with_runtime_settings(fn):
+    """保持已有 MCP 工具的参数签名，请求内（含子任务）沿用同一快照。"""
+    @wraps(fn)
+    async def call(*args, **kwargs):
+        with use_settings():
+            return await fn(*args, **kwargs)
+    return call
+
+
+(_env_file, _), (_keys_file, _) = active_files()
+_ENV_SIGNATURE, _DOTENV = _read_source(_env_file, _load_dotenv, None, {})
+_KEYS_SIGNATURE, _JSON_KEYS = _read_source(_keys_file, _load_keys_json, None, {})
+_initial_env = _effective_env(_DOTENV)
+# 目录和入站 HTTP 鉴权属于启动配置，不能在活跃的监听器上偷偷替换。
+MCP_HTTP_TOKEN = _env_text("MCP_HTTP_TOKEN", env=_initial_env)
+USAGE_LOG_FILE = _state_path(_initial_env, "USAGE_LOG_FILE", "usage.jsonl")
+KEY_STATE_FILE = _state_path(_initial_env, "KEY_STATE_FILE", "key-state.json")   # 仅用于旧版迁移
+USAGE_COUNTER_FILE = _state_path(_initial_env, "USAGE_COUNTER_FILE", "usage-counters.json")
+_SETTINGS = _build_settings(_DOTENV, _JSON_KEYS, 0)
+check_provider_names()
+del _initial_env, _env_file, _keys_file

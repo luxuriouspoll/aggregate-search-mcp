@@ -1,37 +1,25 @@
-"""本地使用记录与用量上限。全部只落在本机配置目录，不进仓库。
+"""本地调用日志与用量上限，均位于本机配置目录。
 
-- usage.jsonl          每次 web_search / web_fetch 一行：查询、模式、各家耗时与条数
-- usage-counters.json  每家每个 key 当日 / 当月已发出的请求数，用于本地上限
+- usage.jsonl：每次 web_search / web_fetch 一行（各家用量、耗时与条数）
+- state.db：各 key 的当日 / 当月用量；带 key 的调用在发送前预占
 
-上限的意义：部分厂商（如百度千帆）超出免费额度后会按量计费。
-这里按“发出的请求数”保守计数；多个进程同时搜索时可能有个位数误差，
-所以默认值留了余量。它是本地软保护，不能替代厂商控制台里的额度告警。
+上限是本机的保守保护，不能替代厂商控制台的额度告警。
 """
 from __future__ import annotations
 
 import json
 import os
 import threading
-import time
 from datetime import datetime, timedelta
 
-from . import store
-from .config import (
-    DAILY_LIMITS,
-    MONTHLY_LIMITS,
-    USAGE_LOG,
-    USAGE_LOG_FILE,
-    USAGE_LOG_MAX_MB,
-    ensure_home,
-    log,
-)
+from . import config, store
+from .config import USAGE_LOG_FILE, ensure_home, log
 
 # 匿名调用没有 key，统一记在这个桶里：只统计，不设上限
 ANON = "anon"
+ACCOUNTING_UNAVAILABLE = "本地用量暂无法确认"
 
 _LOCK = threading.RLock()
-_CACHE: dict | None = None
-_CACHE_MTIME: float = -1.0
 _WARNED: set[str] = set()
 
 
@@ -41,95 +29,64 @@ def _warn_once(tag: str, message: str) -> None:
         log(message)
 
 
-def _periods() -> tuple[str, str]:
-    now = time.localtime()
-    return time.strftime("%Y-%m-%d", now), time.strftime("%Y-%m", now)
-
-
 # ---- 计数器 ----
-
-def _file_mtime() -> float:
-    try:
-        return store.DB_FILE.stat().st_mtime
-    except OSError:
-        return -1.0
-
-
-def _load() -> dict:
-    """读取当日 / 当月计数，整理成 {day: {period: {厂商: {指纹: 次数}}}, month: {...}}。"""
-    global _CACHE, _CACHE_MTIME
-    with _LOCK:
-        mtime = _file_mtime()
-        if _CACHE is not None and mtime == _CACHE_MTIME:
-            return _CACHE
-        data: dict = {"day": {}, "month": {}}
-        for (scope, period, provider, fp), count in store.load_counters().items():
-            data[scope].setdefault(period, {}).setdefault(provider, {})[fp] = count
-        _CACHE = data
-        _CACHE_MTIME = mtime
-        return data
-
-
-def _as_count(value) -> int | None:
-    """计数被手工改坏（NaN、无穷大、字符串）时丢弃那一项，而不是让整个服务报错。"""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        return max(0, int(value))
-    except (ValueError, OverflowError):
-        return None
 
 
 def count_call(provider: str, fp: str) -> None:
-    """记一次发出的请求。fp 是 key 指纹；匿名调用传 ANON。
-
-    用数据库的原子自增：多个客户端同时搜索时不会互相覆盖计数。
-    """
-    day, month = _periods()
-    with _LOCK:
-        store.increment_counters([
-            ("day", day, provider, fp, 1),
-            ("month", month, provider, fp, 1),
-        ])
-        # 让下一次读取重新查库（数据库已变，缓存作废）
-        global _CACHE
-        _CACHE = None
+    """尽力记录一次调用。匿名调用传 ANON；key 池在返回 key 前已经预占，不再调用此函数。"""
+    day, month = store.periods()
+    store.increment_counters([("day", day, provider, fp, 1), ("month", month, provider, fp, 1)])
 
 
 def used(provider: str, fp: str) -> tuple[int, int]:
-    """（今日已用，本月已用）。"""
-    day, month = _periods()
-    data = _load()
-    return (
-        data["day"].get(day, {}).get(provider, {}).get(fp, 0),
-        data["month"].get(month, {}).get(provider, {}).get(fp, 0),
-    )
+    """（今日已用，本月已用）。展示用的容错值，不用于预占。"""
+    day, month = store.read_provider_state(provider, cooldowns=False).used(fp)
+    return day or 0, month or 0
 
 
-def limits_for(provider: str) -> tuple[int, int]:
-    """（每日上限，每月上限），0 表示不限。"""
-    return DAILY_LIMITS.get(provider, 0), MONTHLY_LIMITS.get(provider, 0)
+def limits_for(provider: str, *, reservation: bool = False) -> tuple[int, int]:
+    """（每日上限，每月上限），0 表示不限。预占时兼顾热加载后收紧的额度。"""
+    settings = config.get_settings()
+    daily = settings.DAILY_LIMITS.get(provider, 0)
+    monthly = settings.MONTHLY_LIMITS.get(provider, 0)
+    if reservation:
+        live = config.get_live_settings()
+        if live.revision > settings.revision:
+            live_daily = live.DAILY_LIMITS.get(provider, 0)
+            live_monthly = live.MONTHLY_LIMITS.get(provider, 0)
+            daily = min(daily, live_daily) if daily and live_daily else daily or live_daily
+            monthly = min(monthly, live_monthly) if monthly and live_monthly else monthly or live_monthly
+    return daily, monthly
+
+
+def limit_reason(counts: tuple[int | None, int | None], limits: tuple[int, int]) -> str:
+    daily, monthly = limits
+    today, month = counts
+    if not (daily or monthly):
+        return ""
+    if daily and today is not None and today >= daily:
+        return f"今日已用 {today}/{daily}"
+    if monthly and month is not None and month >= monthly:
+        return f"本月已用 {month}/{monthly}"
+    if today is None or month is None:
+        return ACCOUNTING_UNAVAILABLE
+    return ""
 
 
 def limit_reached(provider: str, fp: str) -> str:
-    """到量返回原因，否则返回空串。"""
-    daily, monthly = limits_for(provider)
-    if not daily and not monthly:
+    """到量或无法可靠记账时返回原因；匿名调用不受上限限制。"""
+    limits = limits_for(provider)
+    if fp == ANON or not any(limits):
         return ""
-    today, month = used(provider, fp)
-    if daily and today >= daily:
-        return f"今日已用 {today}/{daily}"
-    if monthly and month >= monthly:
-        return f"本月已用 {month}/{monthly}"
-    return ""
+    state = store.read_provider_state(provider, cooldowns=False)
+    return limit_reason(state.used(fp), limits)
 
 
 def today_counts(provider: str) -> tuple[int, int]:
     """（今日匿名请求数，今日带 key 请求数）。"""
-    day, _ = _periods()
-    bucket = _load()["day"].get(day, {}).get(provider, {})
-    anon = bucket.get(ANON, 0)
-    return anon, sum(bucket.values()) - anon
+    state = store.read_provider_state(provider, cooldowns=False)
+    anon = state.daily.get(ANON) or 0
+    return anon, sum(value or 0 for value in state.daily.values()) - anon
 
 
 # ---- 使用记录 ----
@@ -140,7 +97,8 @@ def now_iso() -> str:
 
 def log_event(event: dict) -> None:
     """追加一行使用记录。写失败不影响搜索。"""
-    if not USAGE_LOG:
+    settings = config.get_settings()
+    if not settings.USAGE_LOG:
         return
     line = json.dumps({"ts": now_iso(), **event}, ensure_ascii=False)
     with _LOCK:
@@ -148,7 +106,7 @@ def log_event(event: dict) -> None:
             ensure_home()
             USAGE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
             try:
-                too_big = USAGE_LOG_FILE.stat().st_size > USAGE_LOG_MAX_MB * 1024 * 1024
+                too_big = USAGE_LOG_FILE.stat().st_size > settings.USAGE_LOG_MAX_MB * 1024 * 1024
             except OSError:
                 too_big = False
             if too_big:
@@ -274,12 +232,17 @@ def summarize(days: int = 7, recent: int = 10) -> str:
     return "\n".join(lines)
 
 
-def provider_stats(days: int = 7) -> dict[str, dict]:
-    """按厂商汇总近 N 天的真实调用情况（只算真的发出过请求的记录）。
+def _metric(value) -> int | float | None:
+    # 排除 bool、NaN、无穷和坏日志中的离谱数值。
+    return value if type(value) in (int, float) and 0 <= value < (1 << 63) else None
 
-    返回 {厂商: {"calls": 次数, "ok": 有结果次数, "empty": 空结果次数,
-                 "fail": 失败次数, "ms": 累计耗时, "ok_rate": 成功率(0~1)}}。
-    供自适应路由决定「这家值不值得排前面」，不参与额度判断。
+
+def provider_stats(days: int = 7) -> dict[str, dict]:
+    """只汇总已发送的搜索。真正空结果既不奖励也不惩罚，`filtered` 不改写原始 `n`。
+
+    `calls` 包含 `empty`；`hit_rate`/`failure_rate` 只以命中和失败为分母。
+    保留旧 `ok`（命中次数）、`fail`、`ms`（总耗时）、`ok_rate`；后者同 `hit_rate`。
+    `avg_ms` 只使用命中且耗时合法的样本；`latency_samples` 为 0 时 `avg_ms` 为 0。
     """
     stats: dict[str, dict] = {}
     for event in read_events(days):
@@ -295,16 +258,28 @@ def provider_stats(days: int = 7) -> dict[str, dict]:
             if not name:
                 continue
             row = stats.setdefault(name, {
-                "calls": 0, "ok": 0, "empty": 0, "fail": 0, "ms": 0, "ok_rate": 0.0,
+                "calls": 0, "ok": 0, "empty": 0, "fail": 0, "ms": 0,
+                "hit_ms": 0, "latency_samples": 0,
             })
             row["calls"] += 1
-            row["ms"] += int(call.get("ms") or 0)
-            if not call.get("ok"):
+            elapsed = _metric(call.get("ms"))
+            if elapsed is not None:
+                row["ms"] += elapsed
+            if call.get("ok") is not True:
                 row["fail"] += 1
-            elif call.get("n"):
+            elif (_metric(call.get("n")) or 0) > 0:
                 row["ok"] += 1
+                if elapsed is not None:
+                    row["hit_ms"] += elapsed
+                    row["latency_samples"] += 1
             else:
                 row["empty"] += 1
     for row in stats.values():
-        row["ok_rate"] = row["ok"] / row["calls"] if row["calls"] else 0.0
+        decisive = row["ok"] + row["fail"]
+        row["ok_rate"] = row["hit_rate"] = row["ok"] / decisive if decisive else 0.0
+        row["failure"] = row["fail"]
+        row["failure_rate"] = row["fail"] / decisive if decisive else 0.0
+        samples = row["latency_samples"]
+        hit_ms = row.pop("hit_ms")
+        row["avg_ms"] = hit_ms / samples if samples else 0.0
     return stats

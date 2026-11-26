@@ -45,6 +45,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
             title=text_of(item.get("title")),
             snippet=text_of(item.get("content")),
             rank=i,
+            published=text_of(item.get("published_date")),
         )
         for i, item in enumerate(as_items(data, "results"))
     ]
