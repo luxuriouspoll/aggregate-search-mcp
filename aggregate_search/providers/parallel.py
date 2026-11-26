@@ -40,6 +40,8 @@ _HEADERS = {
 # 以前每次搜索都先 initialize 再 notifications/initialized，白白多两次往返。
 # 万一以后服务端改成必须先握手，这里会自动退回完整握手并记住，不用改代码。
 _handshake_required = False
+# 握手拿到的会话头（Mcp-Session-Id 等）。只在服务端确实要求会话时才会有值。
+_SESSION_HEADERS: dict[str, str] = {}
 
 
 def _headers(key: str) -> dict:
@@ -108,7 +110,7 @@ async def _post_call(client: httpx.AsyncClient, headers: dict, name: str, argume
 
 
 async def _call_tool(client: httpx.AsyncClient, name: str, arguments: dict, key: str = "") -> dict:
-    global _handshake_required
+    global _handshake_required, _SESSION_HEADERS
     headers = _headers(key)
     try:
         result = None
@@ -119,10 +121,25 @@ async def _call_tool(client: httpx.AsyncClient, name: str, arguments: dict, key:
                 if not _wants_handshake(exc):
                     raise
         if result is None:
-            result = await _post_call(client, await _handshake(client, headers), name, arguments)
-            # 握手之后真的成功了才记住。否则一次普通的 400（比如参数错误）
-            # 就会让这个进程此后每次调用都多跑两次往返。
-            _handshake_required = True
+            # 复用上次握手拿到的会话；失效（服务端不认）就重新握一次
+            reused = False
+            if _SESSION_HEADERS:
+                try:
+                    result = await _post_call(client, {**headers, **_SESSION_HEADERS}, name, arguments)
+                    reused = True
+                except ProviderError as exc:
+                    if not _wants_handshake(exc):
+                        raise
+                    _SESSION_HEADERS = {}
+            if result is None:
+                session_headers = await _handshake(client, headers)
+                result = await _post_call(client, session_headers, name, arguments)
+                # 握手之后真的成功了才记住。否则一次普通的 400（比如参数错误）
+                # 就会让这个进程此后每次调用都多跑两次往返。
+                _handshake_required = True
+                _SESSION_HEADERS = {k: v for k, v in session_headers.items()
+                                    if k.lower().startswith("mcp-")}
+                _ = reused
     except httpx.HTTPError as exc:
         raise ProviderError(f"{NETWORK_ERROR}: {type(exc).__name__}: {exc}") from exc
     if result.get("isError"):

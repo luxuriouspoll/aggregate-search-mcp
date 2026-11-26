@@ -121,6 +121,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     from .server import web_search
 
     providers = [p for p in (args.providers or "").replace("，", ",").split(",") if p.strip()]
+    domains = [d for d in (args.domains or "").replace("，", ",").split(",") if d.strip()]
     text = asyncio.run(web_search(
         " ".join(args.query),
         max_results=args.max,
@@ -128,6 +129,8 @@ def cmd_search(args: argparse.Namespace) -> int:
         total_results=args.total,
         search_mode=args.mode,
         region=args.region,
+        time_range=args.time_range,
+        domains=domains or None,
     ))
     print(text)
     return 0
@@ -235,7 +238,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"aggregate-search {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="命令")
 
-    sub.add_parser("serve", help="启动 MCP 服务（不带参数时的默认行为）")
+    p = sub.add_parser("serve", help="启动 MCP 服务（不带参数时的默认行为）")
+    p.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio",
+                   help="传输方式，默认 stdio（本地子进程）；streamable-http 用于局域网/远程访问")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="HTTP 监听地址，默认 127.0.0.1（只本机）。绑定其它地址必须配 MCP_HTTP_TOKEN")
+    p.add_argument("--port", type=int, default=8000, help="HTTP 端口，默认 8000")
 
     p = sub.add_parser("init", help="生成全局配置目录和 .env 模板（已有配置不会被覆盖）")
     p.add_argument("--from", dest="source", metavar=".env路径", help="从已有的 .env 文件导入")
@@ -252,6 +260,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--providers", help="只查指定厂商，逗号分隔，如 tavily,exa")
     p.add_argument("--max", type=int, help="每家取几条")
     p.add_argument("--total", type=int, help="最终返回多少个页面")
+    p.add_argument("--time-range", dest="time_range",
+                   help="只要最近一段时间的结果：day / week / month / year（也认 24h、7d、本月）")
+    p.add_argument("--domains", help="只在这些站点里搜，逗号分隔，如 docs.python.org,github.com")
 
     p = sub.add_parser("fetch", help="抓取网页正文")
     p.add_argument("url")
@@ -272,10 +283,16 @@ def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     _prepare_streams()
     if not argv or argv[0] == "serve":
-        # MCP 客户端走这里。stdout 是协议通道，这条路径上不能往 stdout 打印任何东西。
+        # MCP 客户端走这里。stdio 时 stdout 是协议通道，这条路径上不能往 stdout 打印任何东西。
+        transport, host, port = "stdio", "127.0.0.1", 8000
+        if argv:
+            parsed = build_parser().parse_args(argv)
+            transport = getattr(parsed, "transport", "stdio") or "stdio"
+            host = getattr(parsed, "host", "127.0.0.1") or "127.0.0.1"
+            port = getattr(parsed, "port", 8000) or 8000
         from .server import main as serve
 
-        serve()
+        serve(transport=transport, host=host, port=port)
         return
 
     args = build_parser().parse_args(argv)

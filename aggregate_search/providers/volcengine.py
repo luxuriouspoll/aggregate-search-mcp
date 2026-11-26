@@ -20,6 +20,7 @@ from .base import (
     business_status,
     post_json,
     text_of,
+    wants_time,
 )
 
 SEARCH_URL = "https://open.feedcoopapi.com/search_api/web_search"
@@ -36,13 +37,21 @@ _CODE_STATUS = {
 }
 
 
+def _volc_payload(query: str, max_results: int) -> dict:
+    payload = {"Query": query, "SearchType": "web", "Count": max(1, min(max_results, 20))}
+    time_range = wants_time("volcengine")   # 1 天 / 2 周 / 3 月 / 4 年
+    if time_range:
+        payload["TimeRange"] = time_range
+    return payload
+
+
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
     data = await post_json(
         client,
         SEARCH_URL,
         key=key,
         headers={TRAFFIC_TAG: TRAFFIC_VALUE},
-        payload={"Query": query, "SearchType": "web", "Count": max(1, min(max_results, 20))},
+        payload=_volc_payload(query, max_results),
     )
     # 业务错误码在 ResponseMetadata.Error 里
     meta = data.get("ResponseMetadata")

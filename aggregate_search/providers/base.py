@@ -9,7 +9,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
-from ..config import API_KEYS, FETCH_MAX_CHARS, SEARCH_TIMEOUT
+from ..config import API_KEYS, FETCH_MAX_CHARS, OFFICIAL_SOURCE_DOMAINS, SEARCH_TIMEOUT
 
 
 class ProviderError(RuntimeError):
@@ -320,12 +320,34 @@ def _reciprocal_rank_score(sources: list[str], ranks: dict[str, int]) -> float:
     return sum(1.0 / (12 + ranks.get(source, 99)) for source in sources)
 
 
+def _is_official(url: str) -> bool:
+    """这个网址是不是官方一手来源（政策站点、官方文档等）。"""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == domain or host.endswith("." + domain) for domain in OFFICIAL_SOURCE_DOMAINS)
+
+
+# 官方一手来源的等效来源数。取 1.2 的效果：
+#   官网单源(1+1.2=2.2) > 两家低质转载(2.0)，但 < 三家共识(3.0)。
+# 也就是说「官方原文」值得优先读，但多家独立来源互相印证仍然更强。
+OFFICIAL_SOURCE_WEIGHT = 1.2
+
+
+def _weight(item: dict) -> float:
+    """排序用的等效来源数：来源数 + 官方来源加成。"""
+    return item["source_count"] + (OFFICIAL_SOURCE_WEIGHT if item.get("is_official") else 0.0)
+
+
 def _sort_key(item: dict) -> tuple:
-    return (-item["source_count"], -item["score"], item["best_rank"], item["url"])
+    # 第一优先是等效来源数（含官方加成），其次 RRF 分值，再看最佳名次和网址
+    return (-_weight(item), -item["score"], item["best_rank"], item["url"])
 
 
 def _refresh_score(item: dict) -> None:
     item["source_count"] = len(item["sources"])
+    item["is_official"] = _is_official(item["url"])
     item["score"] = _reciprocal_rank_score(item["sources"], item["ranks"])
     item["best_rank"] = min(item["ranks"].values(), default=99)
 
@@ -507,6 +529,22 @@ def as_dict(value) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def error_text(value, *keys: str) -> str:
+    """把「错误」字段变成一行可读文本，供状态码判断用。
+
+    各家的错误可能是字符串，也可能是 {code, message} / {Code, Message} 这样的对象
+    （智谱、腾讯云都是后者）。直接 text_of(dict) 会得到空串，
+    于是「额度用完」被当成认不出的错误，key 就不会被冷却。
+    """
+    if not isinstance(value, dict):
+        return text_of(value)
+    parts = [part for part in (text_of(value.get(key)) for key in keys) if part]
+    if parts:
+        return " ".join(parts)
+    # 没给候选键时，把对象里所有能变成文本的值都拼上
+    return " ".join(part for part in (text_of(item) for item in value.values()) if part)
+
+
 def expect_dict(data, provider: str) -> dict:
     """上游返回非 dict 时抛 ProviderError，而不是让 AttributeError 逃出去。"""
     if not isinstance(data, dict):
@@ -536,3 +574,112 @@ def strict_items(data, provider: str, *path) -> list[dict]:
     if not isinstance(node, list):
         raise ProviderError(f"{provider} 响应 {'.'.join(path)} 不是列表")
     return [item for item in node if isinstance(item, dict)]
+
+
+# ---------------------------------------------------------------------------
+# 搜索过滤条件（时间范围 / 限制站点）
+#
+# 用 contextvar 传而不是改 19 个适配器的函数签名：绝大多数适配器用不到这些条件，
+# 支持的 8 家自己读，其余的在查询里拼 site: 并在汇总阶段后过滤。
+# ---------------------------------------------------------------------------
+
+import contextvars
+
+# 时间范围别名 -> 规范值（day / week / month / year）
+_TIME_ALIASES: dict[str, str] = {
+    "day": "day", "d": "day", "24h": "day", "1d": "day", "today": "day", "daily": "day", "今天": "day", "一天": "day",
+    "week": "week", "w": "week", "7d": "week", "weekly": "week", "本周": "week", "一周": "week", "7天": "week",
+    "month": "month", "m": "month", "30d": "month", "monthly": "month", "本月": "month", "一个月": "month", "30天": "month",
+    "year": "year", "y": "year", "365d": "year", "yearly": "year", "今年": "year", "一年": "year", "12个月": "year",
+}
+
+# 规范值 -> 各家的原生参数
+_TAVILY_TIME = {"day": "day", "week": "week", "month": "month", "year": "year"}
+_BRAVE_FRESHNESS = {"day": "pd", "week": "pw", "month": "pm", "year": "py"}
+_BOCHA_FRESHNESS = {"day": "oneDay", "week": "oneWeek", "month": "oneMonth", "year": "oneYear"}
+_VOLC_TIME = {"day": 1, "week": 2, "month": 3, "year": 4}
+_FIRECRAWL_TBS = {"day": "qdr:d", "week": "qdr:w", "month": "qdr:m", "year": "qdr:y"}
+_PERPLEXITY_RECENCY = {"day": "day", "week": "week", "month": "month", "year": "year"}
+_SEARXNG_TIME = {"day": "day", "week": "week", "month": "month", "year": "year"}
+
+# 当前这次搜索的过滤条件：(规范时间范围或空串, 站点元组)
+_FILTERS: contextvars.ContextVar[tuple[str, tuple[str, ...]]] = contextvars.ContextVar(
+    "aggregate_search_filters", default=("", ())
+)
+
+
+def normalize_time_range(value: str | None) -> str:
+    """把用户写的 time_range 归一成 day / week / month / year；认不出返回空串（不过滤）。"""
+    return _TIME_ALIASES.get((value or "").strip().casefold(), "")
+
+
+def normalize_domains(domains) -> tuple[str, ...]:
+    """规范化站点列表：只取主机名，去掉协议、路径、通配前缀，小写去重。"""
+    out: list[str] = []
+    for raw in domains or []:
+        text = str(raw or "").strip().lower()
+        if not text:
+            continue
+        text = text.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0]
+        text = text.removeprefix("*.").removeprefix(".")
+        if text and "." in text and text not in out:
+            out.append(text)
+    return tuple(out)
+
+
+def set_filters(time_range: str | None = "", domains=None):
+    """设置本次调用生效的过滤条件，返回 token（供 reset_filters 还原）。"""
+    return _FILTERS.set((normalize_time_range(time_range), normalize_domains(domains)))
+
+
+def reset_filters(token) -> None:
+    try:
+        _FILTERS.reset(token)
+    except ValueError:
+        # 跨事件循环重置时 token 会失效，退回默认值即可，不影响结果
+        _FILTERS.set(("", ()))
+
+
+def current_filters() -> tuple[str, tuple[str, ...]]:
+    """当前生效的过滤条件：('week', ('example.com',))。"""
+    return _FILTERS.get()
+
+
+def wants_time(key: str) -> str:
+    """当前时间范围换算成某家的原生参数值；不用过滤或不支持时返回空串/0。"""
+    time_range = current_filters()[0]
+    if not time_range:
+        return ""
+    table = {
+        "tavily": _TAVILY_TIME, "brave": _BRAVE_FRESHNESS, "bocha": _BOCHA_FRESHNESS,
+        "searxng": _SEARXNG_TIME, "firecrawl": _FIRECRAWL_TBS, "perplexity": _PERPLEXITY_RECENCY,
+    }.get(key)
+    if table:
+        return table.get(time_range, "")
+    if key == "volcengine":
+        return _VOLC_TIME.get(time_range, 0)  # type: ignore[return-value]
+    if key == "exa":
+        # Exa 要的是绝对日期
+        days = {"day": 1, "week": 7, "month": 30, "year": 365}[time_range]
+        import datetime as _dt
+        return (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days)).strftime("%Y-%m-%d")
+    return ""
+
+
+def wants_domains() -> tuple[str, ...]:
+    return current_filters()[1]
+
+
+def query_with_sites(query: str) -> str:
+    """给不支持站点过滤的引擎，把站点条件拼进查询（site:a.com OR site:b.com）。"""
+    domains = wants_domains()
+    if not domains:
+        return query
+    sites = " OR ".join(f"site:{domain}" for domain in domains[:5])
+    return f"{query} ({sites})"
+
+
+# 支持原生时间 / 站点过滤的厂商；其余厂商把站点条件拼进查询（site:），时间条件只在汇总时说明
+NATIVE_FILTER_PROVIDERS: frozenset[str] = frozenset({
+    "tavily", "exa", "brave", "bocha", "volcengine", "firecrawl", "perplexity", "searxng",
+})

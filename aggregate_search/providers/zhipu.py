@@ -7,28 +7,34 @@ from __future__ import annotations
 
 import httpx
 
-from .base import SearchResult, business_error, expect_dict, post_json, strict_items
+from .base import SearchResult, business_error, error_text, post_json, strict_items, text_of
 
 SEARCH_URL = "https://open.bigmodel.cn/api/paas/v4/web_search"
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
-    data = expect_dict(await post_json(
-        client, SEARCH_URL, key=key,
+    data = await post_json(
+        client,
+        SEARCH_URL,
+        key=key,
         payload={"search_engine": "search_std", "search_query": query},
-    ), "zhipu")
+    )
     if data.get("error"):
-        raise business_error(str(data["error"]))
+        raise business_error(error_text(data["error"], "message", "msg", "code"))
     items = strict_items(data, "zhipu", "search_result")
-    return [
-        SearchResult(
+    results: list[SearchResult] = []
+    for item in items:
+        url = text_of(item.get("link"))
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        results.append(SearchResult(
             source="zhipu",
-            url=str(item.get("link") or ""),
-            title=str(item.get("title") or "").strip(),
-            snippet=str(item.get("content") or "").strip(),
-            rank=i,
-            published=str(item.get("publish_date") or item.get("date") or ""),
-        )
-        for i, item in enumerate(items)
-        if str(item.get("link") or "").startswith(("http://", "https://"))
-    ][:max_results]
+            url=url,
+            title=text_of(item.get("title")),
+            snippet=text_of(item.get("content")),
+            rank=len(results),
+            published=text_of(item.get("publish_date") or item.get("date")),
+        ))
+        if len(results) >= max_results:
+            break
+    return results

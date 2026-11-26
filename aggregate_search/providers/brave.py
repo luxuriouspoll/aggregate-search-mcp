@@ -12,13 +12,25 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .base import ProviderError, SearchResult, as_items, brief, get_text, text_of
+from .base import (
+    ProviderError,
+    SearchResult,
+    as_items,
+    brief,
+    get_text,
+    text_of,
+    wants_time,
+)
 
 SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
-    params = urlencode({"q": query, "count": min(max_results, 20)})
+    query_params = {"q": query, "count": min(max_results, 20)}
+    freshness = wants_time("brave")
+    if freshness:
+        query_params["freshness"] = freshness
+    params = urlencode(query_params)
     text = await get_text(
         client,
         f"{SEARCH_URL}?{params}",

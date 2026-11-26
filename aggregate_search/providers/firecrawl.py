@@ -19,6 +19,7 @@ from .base import (
     fetch_error,
     post_json,
     text_of,
+    wants_time,
 )
 
 SEARCH_URL = f"{FIRECRAWL_BASE_URL}/v2/search"
@@ -35,11 +36,11 @@ def _check(data: dict, fetching: bool = False) -> dict:
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
-    data = _check(await post_json(client, SEARCH_URL, key=key, payload={
-        "query": query,
-        "limit": max_results,
-        "sources": ["web"],
-    }))
+    payload = {"query": query, "limit": max_results, "sources": ["web"]}
+    tbs = wants_time("firecrawl")           # qdr:d / qdr:w / qdr:m / qdr:y
+    if tbs:
+        payload["tbs"] = tbs
+    data = _check(await post_json(client, SEARCH_URL, key=key, payload=payload))
     items = as_items(data, "data", "web")
     return [
         SearchResult(

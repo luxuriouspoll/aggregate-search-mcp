@@ -17,6 +17,8 @@ from .base import (
     brief,
     post_json,
     text_of,
+    wants_domains,
+    wants_time,
 )
 
 SEARCH_URL = "https://api.tavily.com/search"
@@ -24,11 +26,18 @@ EXTRACT_URL = "https://api.tavily.com/extract"
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
-    data = await post_json(client, SEARCH_URL, key=key, payload={
-        "query": query,
+    payload: dict = {
+        "query": query,  # type: ignore[dict-item]
         "max_results": max_results,
         "search_depth": "basic",
-    })
+    }
+    time_range = wants_time("tavily")
+    if time_range:
+        payload["time_range"] = time_range
+    domains = wants_domains()
+    if domains:
+        payload["include_domains"] = list(domains[:20])
+    data = await post_json(client, SEARCH_URL, key=key, payload=payload)
     return [
         SearchResult(
             source="tavily",

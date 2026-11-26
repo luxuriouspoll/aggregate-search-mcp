@@ -15,10 +15,10 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+from . import store
 from .config import (
     DAILY_LIMITS,
     MONTHLY_LIMITS,
-    USAGE_COUNTER_FILE,
     USAGE_LOG,
     USAGE_LOG_FILE,
     USAGE_LOG_MAX_MB,
@@ -50,47 +50,28 @@ def _periods() -> tuple[str, str]:
 
 def _file_mtime() -> float:
     try:
-        return USAGE_COUNTER_FILE.stat().st_mtime
+        return store.DB_FILE.stat().st_mtime
     except OSError:
         return -1.0
 
 
 def _load() -> dict:
-    """{"day": {"2026-11-25": {厂商: {key 指纹: 次数}}}, "month": {"2026-11": {...}}}"""
+    """读取当日 / 当月计数，整理成 {day: {period: {厂商: {指纹: 次数}}}, month: {...}}。"""
     global _CACHE, _CACHE_MTIME
     with _LOCK:
         mtime = _file_mtime()
         if _CACHE is not None and mtime == _CACHE_MTIME:
             return _CACHE
-        try:
-            raw = json.loads(USAGE_COUNTER_FILE.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raw = {}
         data: dict = {"day": {}, "month": {}}
-        if isinstance(raw, dict):
-            for scope in ("day", "month"):
-                periods = raw.get(scope)
-                if not isinstance(periods, dict):
-                    continue
-                for period, providers in periods.items():
-                    if not isinstance(providers, dict):
-                        continue
-                    clean: dict[str, dict[str, int]] = {}
-                    for provider, bucket in providers.items():
-                        if isinstance(bucket, dict):
-                            clean[str(provider)] = {
-                                str(fp): number
-                                for fp, count in bucket.items()
-                                if (number := _as_count(count)) is not None
-                            }
-                    data[scope][str(period)] = clean
+        for (scope, period, provider, fp), count in store.load_counters().items():
+            data[scope].setdefault(period, {}).setdefault(provider, {})[fp] = count
         _CACHE = data
         _CACHE_MTIME = mtime
         return data
 
 
 def _as_count(value) -> int | None:
-    """计数文件被手工改坏（NaN、无穷大、字符串）时丢弃那一项，而不是让整个服务报错。"""
+    """计数被手工改坏（NaN、无穷大、字符串）时丢弃那一项，而不是让整个服务报错。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
@@ -99,34 +80,20 @@ def _as_count(value) -> int | None:
         return None
 
 
-def _save(data: dict) -> None:
-    global _CACHE, _CACHE_MTIME
-    day, month = _periods()
-    # 只保留当天和当月，文件不会越写越大
-    data["day"] = {day: data["day"].get(day, {})}
-    data["month"] = {month: data["month"].get(month, {})}
-    _CACHE = data
-    try:
-        ensure_home()
-        USAGE_COUNTER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # 临时文件名带进程号，多个进程同时写时不会互相踩
-        tmp = USAGE_COUNTER_FILE.with_name(f"{USAGE_COUNTER_FILE.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, USAGE_COUNTER_FILE)
-        _CACHE_MTIME = _file_mtime()
-    except OSError as exc:
-        _warn_once("counter", f"用量计数写入失败（本地上限在本次运行内仍生效）: {exc}")
-
-
 def count_call(provider: str, fp: str) -> None:
-    """记一次发出的请求。fp 是 key 指纹；匿名调用传 ANON。"""
+    """记一次发出的请求。fp 是 key 指纹；匿名调用传 ANON。
+
+    用数据库的原子自增：多个客户端同时搜索时不会互相覆盖计数。
+    """
     day, month = _periods()
     with _LOCK:
-        data = _load()
-        for scope, period in (("day", day), ("month", month)):
-            bucket = data[scope].setdefault(period, {}).setdefault(provider, {})
-            bucket[fp] = bucket.get(fp, 0) + 1
-        _save(data)
+        store.increment_counters([
+            ("day", day, provider, fp, 1),
+            ("month", month, provider, fp, 1),
+        ])
+        # 让下一次读取重新查库（数据库已变，缓存作废）
+        global _CACHE
+        _CACHE = None
 
 
 def used(provider: str, fp: str) -> tuple[int, int]:
@@ -305,3 +272,39 @@ def summarize(days: int = 7, recent: int = 10) -> str:
                 + f" ｜ {str(event.get('query', ''))[:60]}"
             )
     return "\n".join(lines)
+
+
+def provider_stats(days: int = 7) -> dict[str, dict]:
+    """按厂商汇总近 N 天的真实调用情况（只算真的发出过请求的记录）。
+
+    返回 {厂商: {"calls": 次数, "ok": 有结果次数, "empty": 空结果次数,
+                 "fail": 失败次数, "ms": 累计耗时, "ok_rate": 成功率(0~1)}}。
+    供自适应路由决定「这家值不值得排前面」，不参与额度判断。
+    """
+    stats: dict[str, dict] = {}
+    for event in read_events(days):
+        if event.get("tool") != "web_search":
+            continue
+        calls = event.get("calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict) or call.get("sent") is False:
+                continue
+            name = str(call.get("p") or "")
+            if not name:
+                continue
+            row = stats.setdefault(name, {
+                "calls": 0, "ok": 0, "empty": 0, "fail": 0, "ms": 0, "ok_rate": 0.0,
+            })
+            row["calls"] += 1
+            row["ms"] += int(call.get("ms") or 0)
+            if not call.get("ok"):
+                row["fail"] += 1
+            elif call.get("n"):
+                row["ok"] += 1
+            else:
+                row["empty"] += 1
+    for row in stats.values():
+        row["ok_rate"] = row["ok"] / row["calls"] if row["calls"] else 0.0
+    return stats

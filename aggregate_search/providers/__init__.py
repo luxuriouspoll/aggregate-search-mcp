@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 import ssl
 import threading
 import time
@@ -52,12 +53,16 @@ from . import (
     zhipu,
 )
 from .base import (
+    NATIVE_FILTER_PROVIDERS,
     NETWORK_ERROR,
     FetchResult,
     ProviderError,
     SearchResult,
     redact,
     scrub_urls,
+    query_with_sites,
+    reset_filters,
+    set_filters,
     text_of,
     truncate,
 )
@@ -194,18 +199,66 @@ async def _keep_keys_on_host(response: httpx.Response) -> None:
         )
 
 
-def _client(name: str) -> httpx.AsyncClient:
-    """按 provider 决定走哪条网络：指定的代理、系统设置，或强制直连。"""
+def _network_profile(name: str) -> tuple[str, bool]:
+    """这家走哪种网络：('proxy', 代理地址) 或 ('direct', True/False 是否跟随系统代理)。"""
+    if SEARCH_PROXY and (SEARCH_PROXY_ALL or name in PROXY_PROVIDERS):
+        return "proxy", True
+    return "direct", not USE_SYSTEM_PROXY
+
+
+def _client_kwargs(profile: tuple[str, bool]) -> dict:
+    kind, flag = profile
     kwargs: dict = {
         "follow_redirects": True,
         "verify": ssl_context(),
         "event_hooks": {"response": [_keep_keys_on_host]},
     }
-    if SEARCH_PROXY and (SEARCH_PROXY_ALL or name in PROXY_PROVIDERS):
+    if kind == "proxy":
         kwargs["proxy"] = SEARCH_PROXY
-    elif not USE_SYSTEM_PROXY:
+    elif flag:
         kwargs["trust_env"] = False  # 不读系统代理和 HTTP(S)_PROXY，强制直连
-    return httpx.AsyncClient(**kwargs)
+    return kwargs
+
+
+def _client(name: str) -> httpx.AsyncClient:
+    """按 provider 决定走哪条网络：指定的代理、系统设置，或强制直连。"""
+    return httpx.AsyncClient(**_client_kwargs(_network_profile(name)))
+
+
+# 按（事件循环, 网络配置）复用客户端。httpx 的连接池绑在事件循环上，
+# 所以必须用 WeakKeyDictionary 绑到循环——循环销毁时自动回收，
+# 多个 asyncio.run() 各用各的池，不会出现 "Event loop is closed"。
+_CLIENTS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+async def get_client(name: str) -> httpx.AsyncClient:
+    """取（或新建）本事件循环下这家专用的共享客户端。
+
+    复用连接省掉每次握手和 TLS 协商；不用 async with，由调用方直接 await 使用。
+    """
+    loop = asyncio.get_running_loop()
+    profile = _network_profile(name)
+    per_loop = _CLIENTS.setdefault(loop, {})
+    client = per_loop.get(profile)
+    if client is not None and not client.is_closed:
+        return client
+    client = httpx.AsyncClient(**_client_kwargs(profile))
+    per_loop[profile] = client
+    return client
+
+
+async def close_clients() -> None:
+    """关掉当前事件循环下的共享客户端（进程退出或测试清理时用）。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    per_loop = _CLIENTS.pop(loop, {})
+    for client in per_loop.values():
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 def enabled_search_providers() -> list[str]:
@@ -378,6 +431,8 @@ async def search_one(
     anonymous: bool = False,
     key_fallback: bool = False,
     record: CallRecord | None = None,
+    time_range: str = "",
+    domains=(),
 ) -> CallRecord:
     """调用一家搜索。永不抛业务异常：成败、耗时、用没用 key 都写在返回的记录里。
 
@@ -397,8 +452,13 @@ async def search_one(
                 f"{name} 不支持匿名调用" if anonymous else f"{name} 未配置 API key",
                 sent=False,
             )
-        can_fall_back = key_fallback and has_keys(name)
-        async with _client(name) as client:
+        # 不支持原生站点过滤的引擎，把站点条件拼进查询；支持的用原生参数。
+        # 不支持原生站点过滤的引擎，把站点条件拼进查询；支持的用原生参数。
+        filter_token = set_filters(time_range, domains)
+        try:
+            effective_query = query if name in NATIVE_FILTER_PROVIDERS else query_with_sites(query)
+            can_fall_back = key_fallback and has_keys(name)
+            client = await get_client(name)
             if record.auth == "anon":
                 cooling = anon_cooling(name)
                 if cooling and not (can_fall_back and POOLS[name].usable()):
@@ -411,7 +471,7 @@ async def search_one(
                     usage.count_call(name, usage.ANON)
                     record.anon_sent = True
                     try:
-                        record.results = await search_fn(client, "", query, max_results)
+                        record.results = await search_fn(client, "", effective_query, max_results)
                     except ProviderError as exc:
                         _note_anon_failure(name, exc)
                         if not (can_fall_back and exc.retryable_with_other_key and POOLS[name].usable()):
@@ -419,12 +479,14 @@ async def search_one(
                         record.auth, record.fallback = "key", True
             if record.auth == "key":
                 record.results, used_key = await _with_keys(
-                    name, lambda key: search_fn(client, key, query, max_results), record
+                    name, lambda key: search_fn(client, key, effective_query, max_results), record
                 )
                 record.key_index = POOLS[name].index_of(used_key)
-        record.results = _tidy(record.results)
-        record.ok = True
-        record.count = len(record.results)
+            record.results = _tidy(record.results)
+            record.ok = True
+            record.count = len(record.results)
+        finally:
+            reset_filters(filter_token)
     except Exception as exc:  # CancelledError 是 BaseException，不会被这里吞掉
         record.error = _describe(exc)
     finally:
@@ -439,8 +501,13 @@ async def run_search(
     anonymous=(),
     key_fallback=(),
     deadline: float | None = None,
+    time_range: str = "",
+    domains=None,
 ):
     """并发查询多家，返回 (结果, 错误, 调用记录)。
+
+    time_range / domains  可选过滤条件，透传给支持原生过滤的厂商，
+                          其余厂商在查询里拼 site: 并在汇总阶段后过滤。
 
     anonymous     要强制匿名调用的厂商名集合；传 True 表示全部强制匿名。
     key_fallback  其中哪些厂商在匿名通道被限流时允许改用 key。
@@ -457,12 +524,15 @@ async def run_search(
         CallRecord(provider=name, auth=auth_for(name, force_all or name in anonymous))
         for name in names
     ]
+    # 过滤条件作为参数显式传下去：ensure_future 创建的任务不继承当前 contextvar
     tasks = [
         asyncio.ensure_future(search_one(
             name, query, max_results,
             anonymous=force_all or name in anonymous,
             key_fallback=name in key_fallback,
             record=record,
+            time_range=time_range,
+            domains=domains,
         ))
         for name, record in zip(names, records)
     ]
@@ -506,23 +576,23 @@ async def run_fetch(name: str, url: str, anonymous: bool = False) -> FetchResult
             f"{name} 不支持匿名抓取" if anonymous else f"{name} 未配置 API key 或不可用",
             sent=False,
         )
-    async with _client(name) as client:
-        if auth == "anon":
-            cooling = anon_cooling(name)
-            if cooling:
-                raise ProviderError(
-                    f"匿名通道刚被限流，约 {cooling} 秒后再试", status=429, sent=False
-                )
-            usage.count_call(name, usage.ANON)
-            try:
-                result = await fetch_fn(client, "", url)
-            except ProviderError as exc:
-                # 抓取工具自己报的错不带状态码（见 base.fetch_error），不会触发冷却；
-                # 只有 HTTP 层明确的 401 / 402 / 403 / 429 才会让匿名通道歇一会儿
-                _note_anon_failure(name, exc)
-                raise
-        else:
-            result, _ = await _with_keys(name, lambda key: fetch_fn(client, key, url))
+    client = await get_client(name)
+    if auth == "anon":
+        cooling = anon_cooling(name)
+        if cooling:
+            raise ProviderError(
+                f"匿名通道刚被限流，约 {cooling} 秒后再试", status=429, sent=False
+            )
+        usage.count_call(name, usage.ANON)
+        try:
+            result = await fetch_fn(client, "", url)
+        except ProviderError as exc:
+            # 抓取工具自己报的错不带状态码（见 base.fetch_error），不会触发冷却；
+            # 只有 HTTP 层明确的 401 / 402 / 403 / 429 才会让匿名通道歇一会儿
+            _note_anon_failure(name, exc)
+            raise
+    else:
+        result, _ = await _with_keys(name, lambda key: fetch_fn(client, key, url))
     if not isinstance(result, FetchResult):
         raise ProviderError(f"{name} 返回的不是抓取结果")
     result.title = text_of(result.title)
@@ -541,3 +611,30 @@ def pool_status() -> dict[str, str]:
         for name in REGISTRY
         if name in POOLS and POOLS[name].keys
     }
+
+
+def refresh_pools(keys_by_provider: dict[str, list[str]]) -> None:
+    """按新的 key 字典就地刷新各家 key 池（热加载用）。
+
+    保留还存在的 key 的轮转位置：不会因为改了一个厂商的 key，就把其它家的
+    轮转游标全部重置回第一个 key。已删除的 key 会被移除，冷却状态按指纹自动失效。
+    """
+    for name, keys in keys_by_provider.items():
+        if name not in REGISTRY:
+            continue
+        pool = POOLS.get(name)
+        if pool is None:
+            POOLS[name] = KeyPool(name, list(keys))
+            continue
+        # 记住当前正准备用的那个 key，新列表里还在的话，游标顺着它往后走
+        current = pool.keys[pool._cursor % len(pool.keys)] if pool.keys else None
+        pool.keys = list(keys)
+        if pool.keys:
+            if current in pool.keys:
+                pool._cursor = (pool.keys.index(current) + 1) % len(pool.keys)
+            else:
+                pool._cursor = min(pool._cursor, len(pool.keys) - 1)
+    # 配置里删掉的厂商，池子也收起来
+    for name in list(POOLS):
+        if not keys_by_provider.get(name):
+            POOLS.pop(name, None)

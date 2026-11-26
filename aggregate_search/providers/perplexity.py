@@ -15,10 +15,31 @@ from urllib.parse import quote
 
 import httpx
 
-from .base import ProviderError, SearchResult, as_dict, as_items, brief, post_json, text_of
+from .base import (
+    ProviderError,
+    SearchResult,
+    as_dict,
+    as_items,
+    brief,
+    post_json,
+    text_of,
+    wants_domains,
+    wants_time,
+)
 
 CHAT_URL = "https://api.perplexity.ai/chat/completions"
 DEFAULT_MODEL = "sonar"
+
+
+def _perplexity_filters() -> dict:
+    extra: dict = {}
+    recency = wants_time("perplexity")
+    if recency:
+        extra["search_recency_filter"] = recency
+    domains = wants_domains()
+    if domains:
+        extra["search_domain_filter"] = list(domains[:10])
+    return extra
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
@@ -37,6 +58,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
             ],
             "return_citations": True,
             "return_related_questions": False,
+            **_perplexity_filters(),
         },
     )
     choices = as_items(data, "choices")

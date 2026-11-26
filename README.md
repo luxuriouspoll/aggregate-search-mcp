@@ -34,6 +34,7 @@
 - [故障排查](#故障排查)
 - [从 0.3 升级](#从-03-升级)
 - [项目结构与开发](#项目结构与开发)
+- [变更记录](#变更记录)
 - [安全说明](#安全说明)
 
 ---
@@ -56,6 +57,11 @@
 
 ## 快速开始
 
+> **两个新手最常见的坑，先看一眼：**
+>
+> - **装完 / 升级完记得在客户端里断开重连**。配置和代码都是进程启动时读取的，不重连就一直跑旧的。Windows 上升级前要先断开，否则程序文件被占用，会报 `拒绝访问 (os error 5)` 并把安装弄成半截。
+> - **如果你的代理开着"全局模式"，国内厂商会被绕到境外节点**，表现为百度、火山变慢或报网络错误。切回规则模式，或在 `.env` 里设 `USE_SYSTEM_PROXY=false` 让它们强制直连。
+
 ### 第 1 步：安装命令
 
 推荐用 [uv](https://docs.astral.sh/uv/getting-started/installation/)：
@@ -75,7 +81,7 @@ pip install git+https://github.com/luxuriouspoll/aggregate-search-mcp
 装完验证：
 
 ```bash
-aggregate-search --version
+aggregate-search --version          # 应当显示 0.5.0
 ```
 
 > 提示找不到命令？说明安装目录不在 PATH 里。运行 `uv tool update-shell`，然后**重新打开终端**。
@@ -297,6 +303,8 @@ Parallel、Keenable、AnySearch 不配 key 就能搜。配了 key 也**默认不
 | `query` | 是 | 搜索问题或关键词 |
 | `search_mode` | 否 | `auto`（默认）/ `free` / `escalate` / `all` |
 | `region` | 否 | `domestic` / `global` / `mixed`，不传自动判断 |
+| `time_range` | 否 | 只要最近一段时间的结果：`day` / `week` / `month` / `year`（也认 `24h`、`7d`、`本月`） |
+| `domains` | 否 | 只在这些站点里搜，如 `["docs.python.org","github.com"]`，最多 20 个 |
 | `providers` | 否 | 只查指定厂商，如 `["tavily","exa"]`。配了 key 的会带 key；只想匿名请同时传 `search_mode="free"` |
 | `max_results` | 否 | 每家取几条，默认 5 |
 | `total_results` | 否 | 最终返回多少个页面，默认 12 |
@@ -307,6 +315,7 @@ Parallel、Keenable、AnySearch 不配 key 就能搜。配了 key 也**默认不
 {"query": "中国最新的人工智能政策", "search_mode": "escalate", "region": "domestic"}
 {"query": "MCP 是什么", "search_mode": "free"}
 {"query": "MCP 是什么", "providers": ["tavily", "exa", "parallel"], "max_results": 3}
+{"query": "Go 泛型", "time_range": "month", "domains": ["go.dev"]}
 ```
 
 返回内容：查了几家 / 几家有结果 / 失败几家、本地判断结论、**实际成本**、下一步建议、多源共识、去重后的证据列表（每条带来源）、每家的耗时和状态。
@@ -389,6 +398,7 @@ MCP 客户端只用到不带参数的 `aggregate-search`。其余子命令是给
 | 命令 | 作用 |
 |---|---|
 | `aggregate-search` | 启动 MCP 服务（stdio） |
+| `aggregate-search serve --transport streamable-http --host 127.0.0.1 --port 8000` | 用 HTTP 传输启动，供局域网/远程客户端连接 |
 | `aggregate-search init` | 生成配置目录和 `.env` 模板（已有的不覆盖） |
 | `aggregate-search init --from 路径` | 从已有的 `.env` 导入 |
 | `aggregate-search path` | 显示配置目录 |
@@ -400,6 +410,25 @@ MCP 客户端只用到不带参数的 `aggregate-search`。其余子命令是给
 | `aggregate-search selftest` | 离线自测，不联网，不读也不改你的配置 |
 
 ---
+
+### 用 HTTP 传输给其它机器访问
+
+默认是 stdio（本机子进程）。想让同一局域网的另一台机器用，可以改成 HTTP：
+
+```bash
+aggregate-search serve --transport streamable-http --host 127.0.0.1 --port 8000
+```
+
+**安全硬约束**：绑定到非本机地址（`0.0.0.0`、局域网 IP 等）时，必须设置 `MCP_HTTP_TOKEN`，否则直接拒绝启动；Token 少于 16 位也拒绝。设了 Token 后，请求必须带 `Authorization: Bearer <token>`，否则返回 401。
+
+```bash
+# 生成一个随机 Token
+python -c "import secrets;print(secrets.token_urlsafe(32))"
+
+MCP_HTTP_TOKEN=<上面的值> aggregate-search serve --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+> 不带鉴权的搜索服务等于把本机的 key 和额度开放给整个网络，所以这里宁可启动失败也不放行。
 
 ## 厂商注册地址
 
@@ -434,6 +463,8 @@ MCP 客户端只用到不带参数的 `aggregate-search`。其余子命令是给
 
 **"未实测"是什么意思**：适配器按官方文档写好了，但作者没有这家的 key 或环境，**没有做过真实调用**。匿名源也可能因为共享 IP、地区或上游变更暂时不可用。
 
+**未实测的厂商不会被禁用**，但在补搜顺序里排在已实测厂商之后（国内/国际的分组顺序不变），`aggregate-search status` 里也会标 `⚠️ 未实测`。想调整这份名单，用 `UNVERIFIED_PROVIDERS`。
+
 Perplexity 默认**不参与自动补搜**（它每次搜索是一次大模型调用，比普通搜索贵得多），仍可用 `providers` 点名使用。用 `ESCALATE_EXCLUDE` 调整这份名单。
 
 ---
@@ -453,6 +484,9 @@ Perplexity 默认**不参与自动补搜**（它每次搜索是一次大模型�
 | `FREE_PROVIDERS` | `parallel,keenable,anysearch` | 第一阶段的厂商 |
 | `PAID_PROVIDERS` | 火山、Querit、Tavily、Exa … | 通用补搜顺序。没写进来但配了 key 的自动排最后 |
 | `ESCALATE_EXCLUDE` | `perplexity` | 不参与自动补搜的厂商（仍可点名） |
+| `UNVERIFIED_PROVIDERS` | `yuanbao,zhipu,bocha,brave,ollama,youcom,perplexity,searxng` | 未做真实调用验证的厂商：补搜排在已实测之后，状态页标注，**不禁用** |
+| `ADAPTIVE_ROUTING` | `true` | 按近 7 天表现微调补搜顺序（只在本组内，不跨区、不剔除） |
+| `ADAPTIVE_MIN_CALLS` | `5` | 至少这么多次真实调用才参与调权 |
 | `DAILY_LIMITS` | `baidu:90` | 每个 key 每天最多请求数，如 `baidu:90,tavily:30` |
 | `MONTHLY_LIMITS` | 空 | 每个 key 每月最多请求数 |
 | `AUTO_MIN_RESULTS` | `4` | 判断门槛：最少证据条数 |
@@ -474,6 +508,7 @@ Perplexity 默认**不参与自动补搜**（它每次搜索是一次大模型�
 | `WEB_FETCH_PROVIDER` | 空 | 想固定先用某个后端就写这里，可写多个 |
 | `FETCH_MIN_CHARS` | `200` | 正文短于这个长度就换一家复核（只复核一次）；`0` 关闭 |
 | `FETCH_KEYED_FALLBACKS` | `2` | 免费后端都失败后，最多再试几个带 key 的后端 |
+| `FETCH_CACHE_TTL` | `300` | 同一网址重复抓取的缓存秒数；`0` = 不缓存 |
 | `FETCH_MAX_CHARS` | `20000` | 正文截断长度 |
 
 ### 网络
@@ -509,12 +544,27 @@ Perplexity 默认**不参与自动补搜**（它每次搜索是一次大模型�
 
 ---
 
+## 外部内容隔离（防提示词注入）
+
+搜回来的网页标题、摘要、正文都来自互联网，里面可能藏着"忽略以上指令"之类的话术。所以所有外部内容都会被包进明确的边界标签：
+
+```text
+<untrusted_content source="tavily" url="https://example.com/a">……原文……</untrusted_content>
+```
+
+结果开头还会有一句提示，告诉读它的 AI：标签里是外部不可信数据，只能当素材，不能当指令执行。
+
+防逃逸：如果网页内容里自己伪造了一个 `</untrusted_content>`，会被转义成 `&lt;/untrusted_content&gt;`，无法提前闭合标签把后面的内容"放出来"。
+
+`web_fetch` 返回的标题和正文同样会包进去。
+
 ## 去重与证据合并规则
 
 1. **网址统一**：域名小写、去掉 `www`、默认端口、跟踪参数（`utm_*`、`fbclid` 等）、结尾斜杠；查询参数排序
 2. **保留有意义的差异**：`share_token` 之类有功能的参数和 hash 路由（`#/path`）保留，避免把不同页面错并成一条
 3. **多份证据都留存**：同一网址的标题、摘要、日期全部保留，并标明每条来自哪家
-4. **排序**：被多家搜到的页面优先，其次看各家返回的原始名次
+4. **排序**：等效来源数优先。官方一手来源（gov.cn、官方文档等）按 1.2 个来源加权——
+   压过两家低质转载，但压不过三家独立共识；结果里会标注"官方一手来源"。其次看各家原始名次
 5. **保守折叠**：只有标题和摘要都高度相似的转载才折叠；**版本号、日期、金额等数字不一致时不折叠**（`Python 3.13` 和 `Python 3.14` 的文章不会被合并）
 6. **折叠后重排**：保留转载链接，重新计算来源数和排名
 7. **展示预算**：每个页面最多展示 3 条不同证据，单条摘要最多 500 字；有省略会写明数量
@@ -651,7 +701,8 @@ python -m venv .venv
 - **真实 key 只在本机**：存在配置目录的 `.env` / `keys.json`，或客户端的环境变量里。仓库里只有占位符模板
 - **`.gitignore` 已排除**：`.env`、`.env.*`、`keys.json`、`key-state.json`、`usage.jsonl`、`usage-counters.json`、`*.tmp`
 - **错误信息自动脱敏**：返回给客户端的报错、日志、冷却状态、使用记录在写出前都会把 key 抹掉
-- **只记指纹**：冷却状态和用量计数只记录 key 的 SHA-256 摘要
+- **只记指纹**：冷却状态和用量计数存在本地 SQLite（`state.db`，WAL 模式），只记录 key 的 SHA-256 摘要。多个客户端同时搜索时计数不会互相覆盖；旧的 JSON 状态文件会自动迁移并改名留档
+- **热加载**：改完 `.env` 不用重启服务，下一次调用就生效；`AGGREGATE_SEARCH_HOME` 这类目录路径仍以启动时为准
 - **不跟危险跳转**：带 key 的请求不会跟着跳到别的站点，也不会从 https 跳到不加密的 http
 - **文件权限**：类 Unix 系统上配置目录和 `.env` 只有你自己能读写
 - **使用记录只在本机**：里面有搜过的问题，不想留就设 `USAGE_LOG=false`
@@ -661,6 +712,14 @@ python -m venv .venv
 
 ---
 
+## 变更记录
+
+每个版本改了什么，见 [CHANGELOG.md](CHANGELOG.md)。
+
+最近一版（0.5.0）的要点：修掉博查 `code=200` 的解析 bug 和智慧/元宝额度错误识别问题；新增时间范围与站点过滤、抓取缓存、官方源加权、配置热加载、自适应补搜顺序、可选 HTTP 传输（非回环必须有 Token）；外部内容用 `<untrusted_content>` 隔离并防标签逃逸；冷却状态与计数改用 SQLite，解决多客户端并发写丢数据。
+
 ## 许可
 
-本仓库未附带开源许可证文件。如需引用或分发，请先与作者联系。
+[MIT](LICENSE) © 2026 luxuriouspoll
+
+可以自由使用、修改、分发，包括商用；保留版权声明即可。软件按"现状"提供，不附带任何担保。

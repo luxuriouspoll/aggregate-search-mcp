@@ -300,6 +300,8 @@ def _load_keys_json() -> dict[str, list[str]]:
         return {}
     result: dict[str, list[str]] = {}
     for name, value in data.items():
+        if name.startswith("_"):
+            continue  # 模板里的 _说明 之类的注释键
         if isinstance(value, str):
             value = _split(value)
         if isinstance(value, list):
@@ -331,6 +333,23 @@ def _keys_for(name: str) -> list[str]:
 
 
 # ---- 密钥：name -> [key1, key2, ...]，配置了哪家的 key 哪家就被启用 ----
+# 客户端（MCP 注册项）传进来的环境变量要在读 .env 之前拍个快照。
+# 热加载时先恢复这份快照再重新读 .env，才能保证「客户端 env > .env > keys.json」的优先级不被打乱。
+_CLIENT_ENV: dict[str, str] = {
+    name: os.environ[name]
+    for names in _KEY_ENV_NAMES.values() for name in names if os.environ.get(name)
+}
+_CLIENT_ENV.update({
+    name: value for name, value in os.environ.items()
+    if name in {
+        "SEARCH_MODE", "FREE_PROVIDERS", "PAID_PROVIDERS", "DOMESTIC_PROVIDERS", "GLOBAL_PROVIDERS",
+        "ESCALATE_EXCLUDE", "PROXY_PROVIDERS", "SEARCH_PROVIDERS", "DAILY_LIMITS", "MONTHLY_LIMITS",
+        "WEB_FETCH_PROVIDER", "UNVERIFIED_PROVIDERS", "SEARCH_PROXY", "SEARCH_PROXY_ALL",
+        "USE_SYSTEM_PROXY", "SEARCH_TIMEOUT", "TOTAL_TIMEOUT", "ENABLE_KEYLESS", "ADAPTIVE_ROUTING",
+        "REGION_ROUTING", "FETCH_CACHE_TTL", "FETCH_KEYED_FALLBACKS", "USAGE_LOG",
+    } and value
+})
+
 API_KEYS: dict[str, list[str]] = {name: _keys_for(name) for name in _KEY_ENV_NAMES}
 
 # ---- 自托管 / 可改写端点 ----
@@ -406,6 +425,9 @@ NEAR_DEDUP: bool = _env_bool("NEAR_DEDUP", True)
 FETCH_PREFERRED: list[str] = _names("WEB_FETCH_PROVIDER")
 # 正文短于这个长度视为“可能没抓全”（反爬页 / 空壳页），会再换一个后端试一次；0 关闭。
 FETCH_MIN_CHARS: int = _env_number("FETCH_MIN_CHARS", 200, int, minimum=0)
+# 同一个网址在这么多秒内重复抓取，直接返回缓存（0 = 不缓存）。
+# 一次搜索里多条结果指向同一个页面、或 Agent 连续追问同一页时，能省掉重复的额度。
+FETCH_CACHE_TTL: int = _env_number("FETCH_CACHE_TTL", 300, int, minimum=0)
 # 免费后端都失败后，最多再试几个带 key 的后端。地址本身打不开时，没必要把每家的额度都试一遍。
 FETCH_KEYED_FALLBACKS: int = _env_number("FETCH_KEYED_FALLBACKS", 2, int, minimum=0)
 
@@ -426,12 +448,30 @@ FREE_PROVIDERS: list[str] = _names("FREE_PROVIDERS", "parallel,keenable,anysearc
 # 设为 false 则第一阶段严格匿名：被限流的那家本轮直接算失败。
 ANON_KEY_FALLBACK: bool = _env_bool("ANON_KEY_FALLBACK", True)
 # 通用补搜顺序。名单里没写、但配了 key 的厂商会自动排在最后，不会被漏掉。
+# 排序原则：**作者实测过的排前面**，按文档接入但没实测过的排后面——
+# 未实测不等于不能用，配了 key 照样会轮到你，只是排在后面，先给稳的那些机会。
 # 末尾三家是匿名源的“带 key 版”：同一问题的匿名结果已经有了就不会再选它们。
 PAID_PROVIDERS: list[str] = _names(
     "PAID_PROVIDERS",
-    "volcengine,querit,tavily,exa,firecrawl,jina,yuanbao,baidu,zhipu,bocha,"
-    "brave,ollama,youcom,parallel,keenable,anysearch",
+    # 已实测
+    "volcengine,querit,tavily,exa,firecrawl,jina,baidu,"
+    # 未实测（按文档接入，没有真实调用验证过）
+    "yuanbao,zhipu,bocha,brave,ollama,youcom,"
+    # 匿名源的带 key 版
+    "parallel,keenable,anysearch",
 )
+# 没有经过真实调用验证的厂商：只在状态页标注、补搜时排到后面，**不禁用**。
+UNVERIFIED_PROVIDERS: set[str] = set(_names(
+    "UNVERIFIED_PROVIDERS", "yuanbao,zhipu,bocha,brave,ollama,youcom,perplexity,searxng"
+))
+# 自适应路由：按近 7 天的实际表现微调补搜顺序（只在本组内调整，绝不跨区、不永久剔除）。
+# 关掉它就完全按静态名单排序。
+ADAPTIVE_ROUTING: bool = _env_bool("ADAPTIVE_ROUTING", True)
+# 某家至少要有这么多次真实调用，才允许参与调权（避免几次偶然失败就把好厂商压下去）。
+ADAPTIVE_MIN_CALLS: int = _env_number("ADAPTIVE_MIN_CALLS", 5, int, minimum=1)
+# 成功率低于这个值才降权；高于 0.95 且调用够多的略微提权。
+ADAPTIVE_BAD_RATE: float = _env_number("ADAPTIVE_BAD_RATE", 0.6, float, minimum=0.0)
+ADAPTIVE_GOOD_RATE: float = _env_number("ADAPTIVE_GOOD_RATE", 0.95, float, minimum=0.0)
 # 不参与自动补搜的厂商（仍可用 providers 点名，all 模式也照常包含）。
 # Perplexity 每次搜索是一次大模型调用，比普通搜索贵得多，默认不自动动用。
 ESCALATE_EXCLUDE: set[str] = set(_names("ESCALATE_EXCLUDE", "perplexity"))
@@ -451,6 +491,9 @@ GLOBAL_QUERY_TERMS: list[str] = _terms(
     "GLOBAL_QUERY_TERMS",
     "美国,中美,英国,加拿大,欧洲,欧盟,日本,韩国,新加坡,印度,澳大利亚,俄罗斯,美元,美股,纳斯达克,硅谷,OpenAI,Anthropic,Google,Microsoft,Meta,NVIDIA,Apple,Amazon,Tesla,GitHub,Linux,Kubernetes,Docker,React,Vue,Python,Java,Rust,Go,Node.js,AWS,Azure,GCP,Cloudflare",
 )
+# 英文短词当地域信号容易误判：query 里写 "how to go back" 不该被当成 Go 语言。
+# 这里的词在 routing 里必须区分大小写，并且紧跟版本号 / 语言名 / 常见搭配才算命中。
+CASE_SENSITIVE_QUERY_TERMS: set[str] = {"go"}
 # auto 模式门禁不足时自动追加的不同厂商数；设 0 关闭自动补搜，完全交给 Agent 用 escalate 决定。
 AUTO_ESCALATE_MAX: int = _env_number("AUTO_ESCALATE_MAX", 3, int, minimum=0)
 # escalate 模式每次追加的不同厂商数。
@@ -470,6 +513,11 @@ COMPLEX_QUERY_PATTERNS: list[str] = _terms(
     "对比,比较,区别,哪个好,最新,今天,近期,价格,政策,法规,风险,评测,深度,分析,vs,versus,compare,latest,pricing",
 )
 
+
+# ---- HTTP 传输（只有用 --transport streamable-http 时才相关）----
+# 服务鉴权 Token。绑定非回环地址（对外开放）时**必须**配置，否则拒绝启动——
+# 不带鉴权的搜索服务相当于把本机的 key 和额度开放给整个局域网。
+MCP_HTTP_TOKEN: str = os.environ.get("MCP_HTTP_TOKEN", "").strip()
 
 # ---- 状态与记录文件：默认都在配置目录里，相对路径也挂到配置目录 ----
 def _state_path(env_name: str, default_name: str) -> Path:
@@ -527,3 +575,141 @@ DAILY_LIMITS: dict[str, int] = {
 MONTHLY_LIMITS: dict[str, int] = _parse_limits(
     os.environ.get("MONTHLY_LIMITS", ""), "MONTHLY_LIMITS"
 )
+
+
+# ---- 厂商名拼写校验 ----
+# 这些配置项里写的都是厂商名，拼错一个字就会静默失效（比如 FREE_PROVIDERS=paralel），
+# 表现出来只是「明明配了却不生效」，很难查。这里在启动时统一对一遍，写进 WARNINGS。
+_KNOWN_PROVIDERS: frozenset[str] = frozenset(_KEY_ENV_NAMES) | {"duckduckgo", "searxng", "firecrawl"}
+
+
+def check_provider_names() -> list[str]:
+    """检查各配置项里的厂商名是否拼对，返回问题描述（同时写进 WARNINGS）。"""
+    problems: list[str] = []
+    seen: set[str] = set()
+
+    def check_list(label: str, names, extra: frozenset[str] = frozenset()) -> None:
+        unknown = [name for name in names if name and name not in _KNOWN_PROVIDERS | extra]
+        if not unknown:
+            return
+        message = f"配置 {label} 里的厂商标识无法识别：{', '.join(sorted(set(unknown)))}（拼写有误？）"
+        problems.append(message)
+
+    for label, names in (
+        ("FREE_PROVIDERS", FREE_PROVIDERS),
+        ("PAID_PROVIDERS", PAID_PROVIDERS),
+        ("DOMESTIC_PROVIDERS", DOMESTIC_PROVIDERS),
+        ("GLOBAL_PROVIDERS", GLOBAL_PROVIDERS),
+        ("ESCALATE_EXCLUDE", sorted(ESCALATE_EXCLUDE)),
+        ("PROXY_PROVIDERS", sorted(PROXY_PROVIDERS)),
+        ("SEARCH_PROVIDERS", SEARCH_PROVIDERS_LIMIT or []),
+    ):
+        check_list(label, names)
+    for label, limits in (("DAILY_LIMITS", DAILY_LIMITS), ("MONTHLY_LIMITS", MONTHLY_LIMITS)):
+        check_list(label, list(limits))
+    # 抓取后端只允许真正支持抓取的那几家
+    fetch_names = {"tavily", "keenable", "firecrawl", "ollama", "exa", "jina", "parallel"}
+    bad_fetch = [name for name in FETCH_PREFERRED if name and name not in fetch_names]
+    if bad_fetch:
+        problems.append(
+            f"配置 WEB_FETCH_PROVIDER 里的厂商不支持抓取：{', '.join(sorted(set(bad_fetch)))}"
+            f"（可选：{', '.join(sorted(fetch_names))}）"
+        )
+    # keys.json 里写了不存在的厂商，多半也是拼错了
+    bad_json = [name for name in _JSON_KEYS if name not in _KNOWN_PROVIDERS]
+    if bad_json:
+        problems.append(f"keys.json 里的厂商标识无法识别：{', '.join(sorted(set(bad_json)))}（拼写有误？）")
+
+    for message in problems:
+        if message not in seen:
+            seen.add(message)
+            _warn(message)
+    return problems
+
+
+check_provider_names()
+
+
+# ---------------------------------------------------------------------------
+# 热加载：改了 .env / keys.json 之后，不用重启 MCP 服务就生效
+#
+# 只重载「改完希望马上生效」的东西：各家 key、以及依托 key 的一切派生配置。
+# AGGREGATE_SEARCH_HOME 这类目录级路径保持启动期的值——运行期换目录会让状态文件
+# 和用量记录散落到两个地方，得不偿失。
+# ---------------------------------------------------------------------------
+
+# 热加载会重新读取的环境变量名：各家的 key 变量 + 运行时开关
+_RELOADABLE_ENV: frozenset[str] = frozenset(
+    [env_name for names in _KEY_ENV_NAMES.values() for env_name in names]
+    + [
+        "SEARCH_MODE", "FREE_PROVIDERS", "PAID_PROVIDERS", "DOMESTIC_PROVIDERS",
+        "GLOBAL_PROVIDERS", "ESCALATE_EXCLUDE", "PROXY_PROVIDERS", "SEARCH_PROVIDERS",
+        "DAILY_LIMITS", "MONTHLY_LIMITS", "WEB_FETCH_PROVIDER", "UNVERIFIED_PROVIDERS",
+        "SEARCH_PROXY", "SEARCH_PROXY_ALL", "USE_SYSTEM_PROXY", "SEARCH_TIMEOUT",
+        "TOTAL_TIMEOUT", "ENABLE_KEYLESS", "ADAPTIVE_ROUTING", "REGION_ROUTING",
+        "FETCH_CACHE_TTL", "FETCH_KEYED_FALLBACKS", "USAGE_LOG",
+    ]
+)
+
+_ENV_SIGNATURE: tuple = ()
+
+
+def _files_signature() -> tuple:
+    """两个配置文件的 (路径, mtime, 大小)。没有文件时记 None。"""
+    items = []
+    for path in (ACTIVE_ENV_FILE, ACTIVE_KEYS_FILE):
+        try:
+            stat = path.stat()
+            items.append((str(path), stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            items.append((str(path), None, None))
+    return tuple(items)
+
+
+def mark_loaded() -> None:
+    """记住当前配置文件的指纹（启动时调用一次）。"""
+    global _ENV_SIGNATURE
+    _ENV_SIGNATURE = _files_signature()
+
+
+def reload_if_changed() -> bool:
+    """配置文件变了就重新读一遍。返回 True 表示发生了重载。
+
+    - 只刷新 key 相关配置与派生名单，不动目录级路径
+    - 单行写错照样跳过并告警，不会崩、也不会把密钥打进日志
+    - 客户端传入的环境变量始终优先（重载前先恢复基线）
+    """
+    global _ENV_SIGNATURE, API_KEYS, _JSON_KEYS
+    signature = _files_signature()
+    if signature == _ENV_SIGNATURE:
+        return False
+    _ENV_SIGNATURE = signature
+
+    warnings_before = len(WARNINGS)
+    # 1) 把上次由 .env 写进 os.environ 的值清掉，恢复到「客户端 env」基线。
+    #    注意要比对环境变量名（TAVILY_API_KEYS），不是厂商名（tavily）。
+    for name in _RELOADABLE_ENV:
+        os.environ.pop(name, None)
+    for name, value in _CLIENT_ENV.items():
+        os.environ[name] = value
+
+    # 2) 重新读 .env 与 keys.json
+    _load_dotenv()
+    _JSON_KEYS = _load_keys_json()
+    API_KEYS = {name: _keys_for(name) for name in _KEY_ENV_NAMES}
+
+    # 3) 就地刷新各 provider 的 key 池（保留还存在的 key 的轮转位置）
+    try:
+        from .providers import refresh_pools
+        refresh_pools(API_KEYS)
+    except Exception as exc:  # 循环导入或 provider 层出问题时，至少 key 字典已更新
+        _warn(f"热加载时刷新 key 池失败：{exc}")
+
+    if len(WARNINGS) > warnings_before:
+        log("配置文件已重新加载，但有部分内容有问题（见上方告警）")
+    else:
+        log("配置文件已重新加载（改动即时生效）")
+    return True
+
+
+mark_loaded()

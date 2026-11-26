@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: selftest (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装依赖（可编辑安装）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: 导入校验
+        run: |
+          python -c "import aggregate_search, aggregate_search.server, aggregate_search.cli; print('import ok', aggregate_search.__version__)"
+          python -m aggregate_search --version
+
+      - name: 离线自测（不联网、不读本机配置）
+        run: python -m aggregate_search selftest
+
+      - name: 构建安装包（确认模板随包分发）
+        run: |
+          python -m pip install build
+          python -m build --wheel --sdist --outdir dist
+          python - <<'PY'
+          import glob, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          assert any(n.endswith("templates/env.example") for n in names), "配置模板没进包"
+          assert any(n.endswith("templates/keys.example.json") for n in names), "keys 模板没进包"
+          leaked = [n for n in names if n.endswith(("/.env", "/keys.json"))]
+          assert not leaked, f"安装包里混入了密钥文件: {leaked}"
+          print("wheel 检查通过:", wheel)
+          PY

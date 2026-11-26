@@ -18,10 +18,28 @@ from .base import (
     brief,
     post_json,
     text_of,
+    wants_domains,
+    wants_time,
 )
 
 SEARCH_URL = "https://api.exa.ai/search"
 CONTENTS_URL = "https://api.exa.ai/contents"
+
+
+def _exa_payload(query: str, max_results: int) -> dict:
+    payload = {
+        "query": query,
+        "numResults": min(max_results, 25),
+        "type": "auto",
+        "contents": {"highlights": True},
+    }
+    start = wants_time("exa")          # 绝对日期，形如 2026-11-19
+    if start:
+        payload["startPublishedDate"] = start
+    domains = wants_domains()
+    if domains:
+        payload["includeDomains"] = list(domains[:20])
+    return payload
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
@@ -31,12 +49,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
         key=key,
         headers={"x-api-key": key},
         auth="none",  # Exa 用自己的 header，不再叠 Bearer
-        payload={
-            "query": query,
-            "numResults": min(max_results, 25),
-            "type": "auto",
-            "contents": {"highlights": True},
-        },
+        payload=_exa_payload(query, max_results),
     )
     results = []
     for i, item in enumerate(as_items(data, "results")):

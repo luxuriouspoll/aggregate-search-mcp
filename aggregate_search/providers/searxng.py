@@ -15,13 +15,25 @@ from urllib.parse import urlencode
 import httpx
 
 from ..config import SEARXNG_BASE_URL
-from .base import ProviderError, SearchResult, as_items, brief, get_text, text_of
+from .base import (
+    ProviderError,
+    SearchResult,
+    as_items,
+    brief,
+    get_text,
+    text_of,
+    wants_time,
+)
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
     if not SEARXNG_BASE_URL:
         raise ProviderError("未配置 SEARXNG_BASE_URL（SearXNG 靠实例地址启用，不需要 key）")
-    params = urlencode({"q": query, "format": "json", "safesearch": "0"})
+    query_params = {"q": query, "format": "json", "safesearch": "0"}
+    time_range = wants_time("searxng")
+    if time_range:
+        query_params["time_range"] = time_range
+    params = urlencode(query_params)
     text = await get_text(
         client,
         f"{SEARXNG_BASE_URL}/search?{params}",

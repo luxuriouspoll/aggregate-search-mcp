@@ -20,14 +20,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 import threading
 import time
 from dataclasses import dataclass, field
 
 from . import usage
-from .config import KEY_STATE_FILE, QUOTA_COOLDOWN, RATE_COOLDOWN, ensure_home, log
+from . import store
+from .config import QUOTA_COOLDOWN, RATE_COOLDOWN
 
 INVALID_COOLDOWN = 24 * 3600
 
@@ -313,39 +312,27 @@ _CACHE_MTIME: float = -1.0
 
 def _file_mtime() -> float:
     try:
-        return KEY_STATE_FILE.stat().st_mtime
+        return store.DB_FILE.stat().st_mtime
     except OSError:
         return -1.0
 
 
 def _load_state() -> dict[str, dict[str, KeyState]]:
-    """读取状态。文件被外部改动（mtime 变）或删除时自动重载，无需重启。"""
+    """读取冷却状态（SQLite）。带一层内存缓存，避免每次取 key 都查库。"""
     global _CACHE, _CACHE_MTIME
     with _LOCK:
         mtime = _file_mtime()
         if _CACHE is not None and mtime == _CACHE_MTIME:
             return _CACHE
         data: dict[str, dict[str, KeyState]] = {}
-        try:
-            raw = json.loads(KEY_STATE_FILE.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raw = {}
-        if not isinstance(raw, dict):
-            raw = {}
-        now = time.time()
-        for provider, bucket in raw.items():
-            if not isinstance(bucket, dict):
-                continue
-            # 顺手清掉已过期的条目，避免状态文件随换 key 无限增长
+        for provider, bucket in store.load_key_state().items():
             fresh = {}
             for fp, item in bucket.items():
-                if not isinstance(item, dict):
-                    continue
                 try:
                     reset_at = float(item.get("reset_at", 0) or 0)
                 except (TypeError, ValueError):
-                    continue  # 文件被手工改坏的条目直接丢弃
-                if reset_at > now:  # NaN 的比较恒为假，也会被丢弃
+                    continue
+                if reset_at > time.time():
                     fresh[str(fp)] = KeyState(
                         code=str(item.get("code", "")),
                         message=str(item.get("message", "")),
@@ -359,7 +346,7 @@ def _load_state() -> dict[str, dict[str, KeyState]]:
 
 
 def _save_state(states: dict[str, dict[str, KeyState]]) -> None:
-    """原子写入：先写临时文件再 os.replace，避免崩溃留下半截 JSON。"""
+    """写入冷却状态（SQLite 事务，多进程并发安全）。"""
     global _CACHE, _CACHE_MTIME
     _CACHE = states
     payload = {
@@ -370,15 +357,6 @@ def _save_state(states: dict[str, dict[str, KeyState]]) -> None:
         for provider, bucket in states.items()
         if bucket
     }
-    try:
-        ensure_home()
-        KEY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # 临时文件名带进程号：两个客户端各起一个服务时，不会写到同一个临时文件里
-        tmp = KEY_STATE_FILE.with_name(f"{KEY_STATE_FILE.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, KEY_STATE_FILE)
-        _CACHE_MTIME = _file_mtime()
-    except OSError as exc:
-        # 状态文件写不了不影响搜索，只是重启后丢冷却信息
-        log(f"冷却状态写入失败: {exc}")
+    store.save_key_state(payload)
+    _CACHE_MTIME = _file_mtime()
 

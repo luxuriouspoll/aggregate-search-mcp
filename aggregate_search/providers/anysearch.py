@@ -11,39 +11,40 @@ from .base import (
     ProviderError,
     SearchResult,
     business_error,
-    expect_dict,
     post_json,
     strict_items,
+    text_of,
 )
 
 SEARCH_URL = "https://api.anysearch.com/v1/search"
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
-    data = expect_dict(
-        await post_json(
-            client,
-            SEARCH_URL,
-            key=key,
-            payload={"query": query, "max_results": max_results},
-        ),
-        "anysearch",
+    data = await post_json(
+        client,
+        SEARCH_URL,
+        key=key,
+        payload={"query": query, "max_results": max_results},
     )
     code = data.get("code", 0)
     if code not in (0, "0", None):
-        raise business_error(str(data.get("message") or code))
+        raise business_error(text_of(data.get("message") or code))
     if not isinstance(data.get("data"), dict):
         raise ProviderError("anysearch 响应缺少 data 对象")
     items = strict_items(data["data"], "anysearch", "results")
-    return [
-        SearchResult(
+    results: list[SearchResult] = []
+    for item in items:
+        url = text_of(item.get("url"))
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        results.append(SearchResult(
             source="anysearch",
-            url=str(item.get("url") or ""),
-            title=str(item.get("title") or "").strip(),
-            snippet=str(item.get("snippet") or item.get("content") or "").strip(),
-            rank=i,
-            published=str(item.get("date") or item.get("published_date") or ""),
-        )
-        for i, item in enumerate(items)
-        if str(item.get("url") or "").startswith(("http://", "https://"))
-    ][:max_results]
+            url=url,
+            title=text_of(item.get("title")),
+            snippet=text_of(item.get("snippet") or item.get("content")),
+            rank=len(results),
+            published=text_of(item.get("date") or item.get("published_date")),
+        ))
+        if len(results) >= max_results:
+            break
+    return results

@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import httpx
 
-from .base import SearchResult, business_error, expect_dict, post_json, strict_items
+from .base import SearchResult, business_error, post_json, strict_items, text_of
 
 SEARCH_URL = "https://qianfan.baidubce.com/v2/ai_search/web_search"
 
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
-    data = expect_dict(await post_json(
+    data = await post_json(
         client,
         SEARCH_URL,
         key=key,
@@ -24,19 +24,23 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
             "search_source": "baidu_search_v2",
             "resource_type_filter": [{"type": "web", "top_k": min(max_results, 50)}],
         },
-    ), "baidu")
+    )
     if data.get("code"):
-        raise business_error(str(data.get("message") or data["code"]))
+        raise business_error(text_of(data.get("message") or data.get("code")))
     items = strict_items(data, "baidu", "references")
-    return [
-        SearchResult(
+    results: list[SearchResult] = []
+    for item in items:
+        url = text_of(item.get("url"))
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        results.append(SearchResult(
             source="baidu",
-            url=str(item.get("url") or ""),
-            title=str(item.get("title") or "").strip(),
-            snippet=str(item.get("content") or "").strip(),
-            rank=i,
-            published=str(item.get("date") or ""),
-        )
-        for i, item in enumerate(items)
-        if str(item.get("url") or "").startswith(("http://", "https://"))
-    ][:max_results]
+            url=url,
+            title=text_of(item.get("title")),
+            snippet=text_of(item.get("content")),
+            rank=len(results),
+            published=text_of(item.get("date")),
+        ))
+        if len(results) >= max_results:
+            break
+    return results
