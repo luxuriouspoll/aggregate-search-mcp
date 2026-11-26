@@ -56,30 +56,43 @@ def _connect() -> sqlite3.Connection | None:
     with _LOCK:
         if _CONN is not None:
             return _CONN
-        conn = None
-        try:
-            ensure_home()
-            conn = sqlite3.connect(str(DB_FILE), timeout=5.0, check_same_thread=False)
-            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-            if mode.lower() != "wal":
-                mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        deadline = time.monotonic() + 5.0
+        delay = 0.01
+        while True:
+            conn = None
+            try:
+                ensure_home()
+                conn = sqlite3.connect(str(DB_FILE), timeout=5.0, check_same_thread=False)
+                mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
                 if mode.lower() != "wal":
-                    raise sqlite3.OperationalError("无法启用 WAL")
-            # 预占提交后就会花费上游额度，写 WAL 时也要保证提交的持久性。
-            conn.execute("PRAGMA synchronous=FULL")
-            if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
-                with conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
-                        for statement in _SCHEMA:
-                            conn.execute(statement)
-                        conn.execute("PRAGMA user_version=1")
-            _CONN = conn
-        except (OSError, sqlite3.Error) as exc:
-            if conn is not None:
-                conn.close()
-            log(f"状态数据库不可用（无法记录冷却和用量）：{exc}")
-        return _CONN
+                    mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                    if mode.lower() != "wal":
+                        raise sqlite3.OperationalError("无法启用 WAL")
+                # 预占提交后就会花费上游额度，写 WAL 时也要保证提交的持久性。
+                conn.execute("PRAGMA synchronous=FULL")
+                if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+                    with conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+                            for statement in _SCHEMA:
+                                conn.execute(statement)
+                            conn.execute("PRAGMA user_version=1")
+                _CONN = conn
+                return _CONN
+            except (OSError, sqlite3.Error) as exc:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+                if (isinstance(exc, sqlite3.OperationalError)
+                        and any(k in str(exc).lower() for k in ("locked", "busy"))
+                        and time.monotonic() < deadline):
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.1)
+                    continue
+                log(f"状态数据库不可用（无法记录冷却和用量）：{exc}")
+                return None
 
 
 def reset_connection() -> None:

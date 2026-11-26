@@ -3221,6 +3221,45 @@ def t_sqlite_wal():
     assert timeout >= 5000, timeout
 
 
+@case("多进程同时首次初始化空状态库：并发切换 WAL 不报锁冲突")
+def t_sqlite_concurrent_init():
+    import sqlite3
+    import subprocess
+    import tempfile
+    from contextlib import closing
+
+    with tempfile.TemporaryDirectory(prefix="wal-init-", dir=os.environ["AGGREGATE_SEARCH_HOME"]) as directory:
+        home = Path(directory)
+        children = []
+        try:
+            for i in range(6):
+                children.append(subprocess.Popen(
+                    _child_command(_child_sqlite_init, str(i)), cwd=home, env=_sandbox_env(home),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8",
+                ))
+            reports = [child.communicate(timeout=30) for child in children]
+            assert all(child.returncode == 0 for child in children), reports
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate()
+        with closing(sqlite3.connect(home / "state.db")) as conn:
+            row = conn.execute(
+                "SELECT count FROM usage_counters WHERE scope = 'day' AND provider = 'init-race'"
+            ).fetchone()
+            assert row == (6,), row
+
+
+def _child_sqlite_init(_: str) -> None:
+    from . import store, usage
+
+    conn = store._connect()
+    assert conn is not None and conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    usage.count_call("init-race", usage.ANON)
+    store.reset_connection()
+
+
 @case("SQLite 不可用时，匿名与不限额后端继续，受本地上限约束的 key 不发送")
 async def t_sqlite_unavailable():
     from . import config, providers, store
