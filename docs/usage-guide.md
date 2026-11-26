@@ -39,23 +39,27 @@
 
 ## 2. 从未安装：先让命令可用
 
-使用 [uv](https://docs.astral.sh/uv/getting-started/installation/)，在 PowerShell 或终端运行：
+使用 [uv](https://docs.astral.sh/uv/getting-started/installation/)，在 PowerShell 或终端先装好命令并写入系统 `PATH`：
 
 ```powershell
-uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@master'
+uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.2'
+uv tool update-shell
+```
+
+> **必看防坑（尤其是 Windows 首次用 `uv` 装工具）**：`uv` 默认把命令装在 `%USERPROFILE%\.local\bin`（macOS / Linux 为 `~/.local/bin`），首次安装往往不在系统 `PATH` 里，直接运行会报“无法将‘aggregate-search’项识别为 cmdlet…”。跑完 `uv tool update-shell` 后，**关掉当前终端并新开一个窗口**（不想关窗口可临时运行 `$env:PATH = "$HOME\.local\bin;$env:PATH"`），再继续执行初始化与自检：
+
+```powershell
 aggregate-search --version
 aggregate-search init
 aggregate-search selftest
 aggregate-search status
 ```
 
-也可以克隆仓库，在根目录执行 `uv tool install .`。`init` 会创建配置模板，不会覆盖旧 `.env`。不知道配置在哪里就运行 `aggregate-search path`；默认是 Windows 的 `%USERPROFILE%\.aggregate-search`，macOS / Linux 的 `~/.aggregate-search`。**第一次使用不用申请 API Key**，先试匿名源即可。
+也可以克隆仓库，在根目录执行 `uv tool install .`。`init` 会创建配置模板，不会覆盖旧 `.env`。不知道配置在哪里就运行 `aggregate-search path`。**第一次使用不用申请 API Key**，先试匿名源即可。
 
-如果 `uv` 已安装但终端找不到 `aggregate-search`，先执行 `uv tool update-shell`，再重新打开终端；图形客户端也可能需要重启一次才能读取新 PATH。
+## 3. 接入任意 MCP 客户端（ZCode / Codex / dsh / Claude Code / Cursor 等）
 
-## 3. 接入 ZCode 或其它 MCP 客户端
-
-本机使用 **stdio**：在 MCP 服务管理里新增一项（已有项就复用），把以下三项填好：
+本服务基于标准 MCP 协议，所有支持 MCP 的 Agent 都能直接共用同一份 `~/.aggregate-search` 配置与额度账本。本机使用 **stdio**：在客户端的 MCP 服务管理里新增一项（已有项就复用），把以下三项填好：
 
 | 字段 | 值 |
 |---|---|
@@ -63,7 +67,7 @@ aggregate-search status
 | 启动命令 | `aggregate-search` |
 | 启动参数 | 留空 |
 
-如果界面提示找不到命令，把启动命令改为 `where.exe aggregate-search` 得到的 `.exe` 完整路径。对于文件配置，可参照 [ZCode 示例](../README.md#zcode) 或 [通用 MCP 示例](../README.md#通用写法claude-desktopcursorcline-等)。本机 stdio **不用手工先启动服务器**，客户端会拉起进程。只有跨机器访问才考虑 [Streamable HTTP](../README.md#可选-http-传输)。
+如果客户端在执行 `uv tool update-shell` 之前就已经打开，它缓存的还是旧 `PATH`：要么完全退出重开客户端，要么把启动命令直接填成 `where.exe aggregate-search`（macOS / Linux 用 `which aggregate-search`）查到的完整绝对路径。配置文件写法可参照 README 中的 [Codex](../README.md#codex)、[DeepSeek Harness（dsh）](../README.md#deepseek-harnessdsh)、[ZCode](../README.md#zcode) 或 [通用 MCP 示例](../README.md#通用写法claude-desktopcursorclinewindsurf-等)。本机 stdio **不用手工先启动服务器**，客户端会按需拉起进程；跨机器或容器访问再考虑 [Streamable HTTP](../README.md#可选-http-传输)。
 
 重连后，在工具列表里应该看到：
 
@@ -121,8 +125,9 @@ aggregate-search reset-cooldown tavily --apply   # 确认后才执行
 
 | 看到什么 | 先做什么 |
 |---|---|
-| 终端仍显示 `0.5.0`，或客户端表现像旧版 | `where.exe aggregate-search` 查看是否有多个入口；必要时给客户端填新版 `.exe` 绝对路径。升级后别忘了断开再重连。 |
-| `拒绝访问 (os error 5)` | 停掉仍在用旧程序的 MCP 实例或退出客户端，再重跑安装命令。不要删除配置目录。 |
+| 报“无法将 `aggregate-search` 项识别为 cmdlet…”或 `command not found` | `~/.local/bin` 还没进 `PATH`。运行 `uv tool update-shell`，然后**重新打开终端**；桌面客户端报找不到命令时，重开客户端或直接填 `where.exe aggregate-search` 查到的绝对路径。 |
+| 终端仍显示旧版本，或客户端表现像旧版 | `where.exe aggregate-search` 查看是否有多个入口；必要时给客户端填新版 `.exe` 绝对路径。升级后别忘了断开再重连。 |
+| `拒绝访问 (os error 5)` | Windows 锁住了正在运行的 `.exe`。把所有连着它的客户端（ZCode、Codex、dsh 等）先断开或退出，再重跑安装命令。不要删除配置目录。 |
 | 上游超时或无结果 | 先用 `status` 检查匿名后端、代理和冷却；再用 `--mode free` 测一次。`check` 会真实发请求，未开硬锁时可能消耗已配置的账号额度。 |
 | 开了 `--time-range week` 结果很少 | 这是严格筛选：只保留有可核验且落在窗口内的发布日期；缺时间的内容会被排除。如果不需要严格时效，去掉 `--time-range` 再搜。 |
 | 保存 `.env` 后没效果 | 用 `path` 和 `status` 核对读取的是哪个目录，检查客户端是否注入了同名配置。目录、日志路径、HTTP 鉴权 Token 或监听参数仍需要重启服务。 |

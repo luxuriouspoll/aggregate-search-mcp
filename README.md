@@ -5,7 +5,7 @@
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**免费优先的多源聚合联网搜索 MCP 服务** —— 把 19 家国内外搜索与网页抓取通道收拢成统一入口，交给 Claude Code、Codex、ZCode、Cursor 等 AI 客户端直接调用。
+**免费优先的多源聚合联网搜索 MCP 服务** —— 标准 MCP 协议通用实现，把 19 家国内外搜索与网页抓取通道收拢成统一入口，交给 Claude Code、Codex、DeepSeek Harness（dsh）、ZCode、Cursor、Cline 等任意 AI 客户端直接共用。
 
 [快速开始](#快速开始) · [新手与升级指南](docs/usage-guide.md) · [接入客户端](#接入-mcp-客户端) · [支持厂商](#厂商注册地址) · [版本发布](https://github.com/luxuriouspoll/aggregate-search-mcp/releases) · [变更记录](CHANGELOG.md)
 
@@ -84,15 +84,16 @@
 
 ```bash
 uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.2'
+uv tool update-shell                # 首次用 uv 装全局工具必跑：把 ~/.local/bin 写入系统 PATH
 ```
 
-想跟随开发主分支可用 `@master`；也可克隆仓库后在根目录用 `uv tool install .` 或 `pipx install .`（虚拟环境内用 `python -m pip install .`）。安装后验证版本：
+> **Windows / 新装 `uv` 防坑提示**：首次用 `uv tool install` 安装工具时，末尾常提示 `` `C:\Users\...\.local\bin` is not on your PATH ``，此时直接在当前窗口运行 `aggregate-search` 会报“无法将‘aggregate-search’项识别为 cmdlet…”。执行一次上面的 `uv tool update-shell`，然后**关掉并重新打开终端窗口**（已打开的旧窗口和桌面客户端不会自动刷新 `PATH`），再验证版本：
 
 ```bash
 aggregate-search --version          # 显示 aggregate-search 0.5.2
 ```
 
-> 提示找不到命令？说明安装目录不在 PATH 里。运行 `uv tool update-shell`，然后**重新打开终端**。
+想跟随开发主分支可用 `@master`；也可克隆仓库后在根目录用 `uv tool install .` 或 `pipx install .`（虚拟环境内用 `python -m pip install .`）。
 
 ### 第 2 步：生成配置文件
 
@@ -123,14 +124,14 @@ aggregate-search search "MCP 是什么"      # 真的搜一次
 
 ### 升级与卸载
 
-已有 uv 全局安装的用户，只需就地升级；保留 MCP 注册项和 `aggregate-search path` 指向的配置目录。**Windows 上先断开 MCP 或退出使用它的客户端**，然后任选其一：
+已有 uv 全局安装的用户，只需就地升级；保留 MCP 注册项和 `aggregate-search path` 指向的配置目录。**Windows 上请先断开所有连着它的客户端（如 ZCode、Codex、dsh 等）**，避免文件占用报 `拒绝访问 (os error 5)`，然后任选其一：
 
 ```bash
-# 在已更新的本地源码仓库根目录执行
-uv tool install --force --reinstall .
+# 升级到最新固定发布版（推荐，不需要先克隆）
+uv tool install --force --reinstall 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.2'
 
-# 或从 GitHub 默认分支更新，不需要先克隆
-uv tool install --force --reinstall --upgrade 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@master'
+# 或在已更新的本地源码仓库根目录执行
+uv tool install --force --reinstall .
 ```
 
 用 `aggregate-search --version` 确认新版，再重连客户端。遇到 `拒绝访问 (os error 5)`，先停止仍占用程序的旧进程，不要删配置或重复注册。完整步骤见 [使用指南](docs/usage-guide.md)。
@@ -141,9 +142,11 @@ uv tool install --force --reinstall --upgrade 'git+https://github.com/luxuriousp
 
 ## 接入 MCP 客户端
 
-下面的配置示例使用默认的 stdio：**启动命令填 `aggregate-search`，不需要参数，也不用在这里填 key**（可在配置目录的 `.env` 里设置）。远程客户端可改用 [Streamable HTTP](#可选-http-传输)。
+本服务遵循标准 MCP 协议，**不绑定特定客户端或大模型**（Claude、GPT、DeepSeek、Gemini 等均可调用）。同一台电脑上同时在多个 Agent 里挂载时，各进程会通过 `~/.aggregate-search/state.db`（SQLite WAL）安全共享同一份 `.env` 密钥池、冷却状态与日/月用量上限，无需重复填 Key。
 
-### 通用写法（Claude Desktop、Cursor、Cline 等）
+下面的配置示例使用默认的 stdio：**启动命令填 `aggregate-search`，不需要参数，也不用在这里填 key**。跨机器、容器或工作流平台（OpenClaw、Dify、n8n 等）可改用 [Streamable HTTP](#可选-http-传输)；不支持 MCP 但能跑终端命令的 Agent 可直接调 `aggregate-search search "关键词"`。
+
+### 通用写法（Claude Desktop、Cursor、Cline、Windsurf 等）
 
 ```json
 {
@@ -167,6 +170,21 @@ claude mcp add --scope user aggregate-search -- aggregate-search
 command = "aggregate-search"
 ```
 
+### DeepSeek Harness（dsh）
+
+可在设置界面添加 stdio MCP（命令填 `aggregate-search`，参数留空），或在对应 Profile（如 `~/.dsh/profiles/desktop/cordis.patch.yml` 或 `web/cordis.patch.yml`）追加：
+
+```yaml
+- insert:
+    - id: mcp-aggregate-search
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: "aggregate-search"
+        transport: "stdio"
+        command: "aggregate-search"
+        args: []
+```
+
 ### ZCode
 
 在 `~/.zcode/cli/config.json` 中，保留其它 MCP，并将这项合并到 `mcp.servers`：
@@ -183,7 +201,7 @@ command = "aggregate-search"
 
 ### 客户端找不到命令怎么办
 
-有些图形界面程序读不到终端里的 PATH。把 `command` 换成完整路径：
+刚跑完 `uv tool update-shell` 时，**已打开的图形界面客户端（ZCode、Cursor、dsh 桌面版等）仍缓存着旧的环境变量**；部分 GUI 程序也不读取终端 Shell 的 PATH。完全退出重开客户端，或直接把 `command` 换成查出来的绝对路径最稳：
 
 ```bash
 where.exe aggregate-search # Windows PowerShell/CMD，例如 C:\Users\你\.local\bin\aggregate-search.exe
