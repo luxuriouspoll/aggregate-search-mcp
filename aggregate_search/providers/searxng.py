@@ -1,9 +1,9 @@
 """SearXNG（自托管元搜索，https://docs.searxng.org）
 
-搜索: GET {get_settings().SEARXNG_BASE_URL}/search?q=...&format=json
+搜索: GET {SEARXNG_BASE_URL}/search?q=...&format=json
       -> results[]: {url, title, content, publishedDate}
 
-不需要 key，靠实例地址启用（get_settings().SEARXNG_BASE_URL）。
+不需要 key，靠实例地址启用（SEARXNG_BASE_URL）。
 注意：实例必须允许 JSON 输出（settings.yml 里 search.formats 含 json），
 否则只返回 403 Forbidden。部分公共实例会禁用 JSON 格式。
 """
@@ -28,7 +28,7 @@ from .base import (
 
 async def search(client: httpx.AsyncClient, key: str, query: str, max_results: int) -> list[SearchResult]:
     if not get_settings().SEARXNG_BASE_URL:
-        raise ProviderError("未配置 get_settings().SEARXNG_BASE_URL（SearXNG 靠实例地址启用，不需要 key）")
+        raise ProviderError("未配置 SEARXNG_BASE_URL（SearXNG 靠实例地址启用，不需要 key）", sent=False)
     query_params = {"q": query, "format": "json", "safesearch": "0"}
     time_range = wants_time("searxng")
     if time_range:

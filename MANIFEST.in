@@ -2,4 +2,4 @@ include CHANGELOG.md docs/usage-guide.md
 recursive-include aggregate_search/templates *.example *.example.json
 prune .venv
 prune .git
-global-exclude .env .env.* keys.json state.db state.db-* usage.jsonl usage.jsonl.* key-state.json* usage-counters.json* *.pyc
+global-exclude .env .env.* .env~ keys.json keys.json.* keys.json~ *.db *.db-* *.sqlite *.sqlite-* *.sqlite3 *.sqlite3-* usage.jsonl* *.log *.log.* key-state.json* .key-state.json* usage-counters.json* *.migrated *.migrated.* *.tmp *.pyc

@@ -1,12 +1,12 @@
 [project]
 name = "aggregate-search-mcp"
 dynamic = ["version"]
-description = "聚合联网搜索 MCP：匿名源优先、不足再补 3 个不同厂商、同厂商多 key 轮转、跨厂商去重与证据汇总"
+description = "免费优先的多源聚合联网搜索 MCP：集成 19 家国内外搜索源，支持零 Key 匿名起跑、覆盖度门禁自动补搜、多 Key 轮换防超支、跨源去重与正文抓取"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-keywords = ["mcp", "search", "web-search", "tavily", "exa", "llm", "agent"]
+keywords = ["mcp", "mcp-server", "web-search", "search", "tavily", "exa", "perplexity", "llm", "ai-agent"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -22,6 +22,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/luxuriouspoll/aggregate-search-mcp"
+Documentation = "https://github.com/luxuriouspoll/aggregate-search-mcp/blob/master/docs/usage-guide.md"
+Changelog = "https://github.com/luxuriouspoll/aggregate-search-mcp/blob/master/CHANGELOG.md"
 Repository = "https://github.com/luxuriouspoll/aggregate-search-mcp"
 Issues = "https://github.com/luxuriouspoll/aggregate-search-mcp/issues"
 

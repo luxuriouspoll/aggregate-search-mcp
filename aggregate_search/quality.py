@@ -11,10 +11,14 @@ from dataclasses import dataclass, field
 from . import config
 from .providers.base import is_official_url, normalize_url, numeric_terms
 
-_STOPWORDS = {
+_ZH_STOPWORDS = {
     "什么", "如何", "怎么", "是否", "一个", "一下", "最新", "今天", "近期",
-    "the", "what", "how", "is", "are", "and", "for", "with", "from", "that",
+    "政策", "价格", "相关", "信息", "情况", "查询",
 }
+_STOPWORDS = _ZH_STOPWORDS | {"the", "what", "how", "is", "are", "and", "for", "with", "from", "that"}
+_ZH_WORD = re.compile(r"[\u4e00-\u9fff]{2,}")
+_ZH_STOP = re.compile("|".join(sorted(_ZH_STOPWORDS)))
+_MAX_BIGRAMS = 32
 
 
 def is_complex_query(query: str) -> bool:
@@ -28,15 +32,36 @@ def is_complex_query(query: str) -> bool:
 def _query_terms(query: str) -> list[str]:
     words = re.findall(r"[a-zA-Z][a-zA-Z0-9_.+-]{1,}|[\u4e00-\u9fff]{2,}", query.casefold())
     terms: list[str] = []
+    spans: list[str] = []
     for word in words:
         if word in _STOPWORDS:
             continue
-        if re.fullmatch(r"[\u4e00-\u9fff]{4,}", word):
-            # 中文没有空格，保留全词并补充二元片段用于宽松命中。
-            terms.append(word)
-            terms.extend(word[i:i + 2] for i in range(0, len(word) - 1, 2))
-        else:
-            terms.append(word)
+        if _ZH_WORD.fullmatch(word) and len(word) > 2:
+            # 不从停用词内部或两侧拼出新的匹配词（例如「最新政策」中的「新政」）。
+            parts = _ZH_STOP.split(word)
+            if not any(parts):
+                continue
+            spans.extend(part for part in parts if len(part) >= 2)
+        terms.append(word)
+
+    # 上限按整条查询算，不按段重置；只切出选中的重叠二元词，不展开所有字对。
+    total = sum(len(span) - 1 for span in spans)
+    positions = range(total) if total <= _MAX_BIGRAMS else (
+        i * (total - 1) // (_MAX_BIGRAMS - 1) for i in range(_MAX_BIGRAMS)
+    )
+    samples = iter(positions)
+    pos = next(samples, total)
+    start = 0
+    for span in spans:
+        end = start + len(span) - 1
+        while pos < end:
+            i = pos - start
+            terms.append(span[i:i + 2])
+            pos = next(samples, total)
+        start = end
+    if not terms:
+        # 有实体时「价格」不能代替实体命中；没有其它词项时它本身可能是检索目的（600519 价格）。
+        terms.extend(term for term in ("价格", "政策") if term in query)
     return list(dict.fromkeys(terms))
 
 
@@ -51,6 +76,9 @@ def _evidence_hits(title: str, snippet: str, terms: list[str], numbers: set[str]
 
 def _relevant_items(query: str, items: list[dict]) -> list[dict]:
     terms = _query_terms(query)
+    if not terms and _ZH_WORD.search(query):
+        # 只有中文停用词时不走「无词项」或「纯数字」的后备分支。
+        return []
     numbers = numeric_terms(query)
     relevant = []
     for item in items:

@@ -756,6 +756,7 @@ async def t_status():
     assert "parallel（匿名） → keenable（匿名）" in text, text
     assert "第一阶段匿名调用，匿名被限流、补搜或点名指定时才用 key" in text, text
     assert "baidu 每日 90 次/key" in text, text
+    assert "本进程生效" in text and "CLI status" in text and "web_status" in text, text
     assert "近 7 天使用记录" in await server.web_status(usage_days=7)
 
 
@@ -1920,6 +1921,76 @@ async def t_adapters_error_mapping():
             raise AssertionError("HTTP 429 应当报错")
 
 
+@case("Perplexity：先给结构化网页，再用旧引用补位；摘要不冒用网页日期")
+async def t_perplexity_evidence():
+    from datetime import datetime, timezone
+    from .providers import perplexity
+    from .providers.base import ProviderError, filter_results
+
+    page = {"url": "https://docs.example/news", "title": "原始报道", "snippet": "网页摘要",
+            "date": "2026-03-10", "last_updated": "2026-11-25"}
+    other = "https://news.example/a"
+    structured = [None, {"url": "https://"}, page, dict(page, url=page["url"] + "?utm_source=other")]
+    body = {"choices": [{"message": {"content": "模型生成的综述"}}],
+            "search_results": structured, "citations": [None, page["url"], other, other]}
+
+    async def search(data, limit):
+        async with _mock_client(200, data) as client:
+            return await perplexity.search(client, _fake_key("perplexity"), "测试", limit)
+
+    items = await search(body, 5)
+    assert len(items) == 3 and [item.rank for item in items] == [0, 1, 2], items
+    first, second, summary = items
+    assert (first.url, first.title, first.snippet) == (page["url"], page["title"], page["snippet"]), items
+    assert first.published == page["date"] and dict(first.dates) == {"last_updated": page["last_updated"]}
+    assert second.url == other and not second.published
+    assert summary.url.startswith("https://www.perplexity.ai/") and summary.snippet == "模型生成的综述"
+    assert not summary.published and not summary.dates
+    assert [item.url for item in await search(body, 1)] == [page["url"]]
+    assert [item.url for item in await search({"search_results": structured}, 5)] == [page["url"]]
+    assert [item.url for item in await search({"citations": ["broken", other, other]}, 2)] == [other]
+    window = datetime(2026, 11, 26, tzinfo=timezone.utc)
+    assert not filter_results(items, "week", (), window), "3 月发布的页面不能因 11 月更新而通过门禁"
+    recent = await search({"search_results": [dict(page, date="2026-11-25")]}, 1)
+    assert filter_results(recent, "week", (), window) == recent
+    try:
+        await search({"choices": [], "search_results": [{"url": ""}]}, 5)
+    except ProviderError:
+        pass
+    else:
+        raise AssertionError("没有可用网页或答案时应该报错")
+
+
+@case("Perplexity：长站点名单不截掉尾部，旧引用在带筛选时优先于合成摘要")
+async def t_perplexity_scope():
+    import json
+    import httpx
+
+    from .providers import perplexity
+    from .providers.base import reset_filters, set_filters
+
+    sites = [f"site{i:02d}.example" for i in range(12)]
+    captured = []
+    url = "https://site00.example/report"
+
+    def handler(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "独立答案"}}], "citations": [url]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        for size in (10, 12):
+            token = set_filters("week", sites[:size])
+            try:
+                items = await perplexity.search(client, _fake_key("perplexity"), "天气", 1)
+            finally:
+                reset_filters(token)
+            assert len(items) == 1 and items[0].url == url and not items[0].published
+    short, long = captured
+    assert short["search_domain_filter"] == sites[:10] and short["messages"][-1]["content"] == "天气"
+    assert "search_domain_filter" not in long and all(f"site:{s}" in long["messages"][-1]["content"] for s in sites)
+    assert short["search_recency_filter"] == long["search_recency_filter"] == "week"
+
+
 @case("真实适配器：19 家正常响应都能解析出结果")
 async def t_adapters_parse_normal():
     import json as _json
@@ -2439,6 +2510,73 @@ async def t_strict_date_filter_and_backfill():
             assert visible == (name != "volcengine" and label == "recent"), (name, label, reply)
 
 
+@case("严格时间：中文发布日期按 UTC 日历日（含边界），不借用其他日期")
+def t_strict_chinese_publication_date():
+    from datetime import datetime, timezone
+
+    from .providers.base import SearchResult, filter_results
+
+    as_of = datetime(2024, 3, 1, 0, 30, tzinfo=timezone.utc)
+    url = "https://example.org/story"
+    values = ["2024年2月29日", "2024年03月01日", "2024-02-29", "2024年2月28日", "2024年3月2日",
+              "2024年2月30日", "2024年0月1日", "昨天", "更新于2024年3月1日", "2024年3月1日 00:01"]
+    rows = [SearchResult("test", url, "", published=v) for v in values]
+    rows.append(SearchResult("test", url, "2024年3月1日", dates=(("updated", values[0]), ("crawled", values[1]))))
+    assert filter_results(rows, "day", None, as_of) == rows[:3]
+
+
+@case("严格时间：RFC 发布时刻用可靠显式时区，按 UTC 秒比较")
+def t_strict_rfc_publication_date():
+    from datetime import datetime, timezone
+
+    from .providers.base import SearchResult, filter_results
+
+    as_of = datetime(2024, 3, 1, 0, 30, tzinfo=timezone.utc)
+    good = ["Thu, 29 Feb 2024 00:30:00 GMT", "Fri, 01 Mar 2024 00:30:00 UTC",
+            "Fri, 1 Mar 2024 08:30:00 +0800", "28 Feb 2024 19:30 -0500", "1 Mar 2024 00:30 +0000"]
+    bad = ["29 Feb 2024 00:29:59 GMT", "1 Mar 2024 08:30:01 +0800", "30 Feb 2024 00:30 GMT",
+           "Thu, 1 Mar 2024 00:30 GMT", "1 Mar 2024 00:30 +0000 extra"]
+    bad += [f"1 Mar 2024 00:30 {zone}" for zone in ("", "-0000", "CST", "XYZ", "+0060", "+2400", "UTC +0100")]
+    rows = [SearchResult("test", "https://example.org/story", "", published=v) for v in good + bad]
+    assert [r.published for r in filter_results(rows, "day", None, as_of)] == good
+
+
+@case("中文相关性：重叠片段召回能源、保留汽车；泛词和跨证据数字不能凑命中")
+def t_chinese_evidence_relevance():
+    from .quality import assess_quality
+
+    def pages(query, *snippets):
+        item = {"url": "https://example.org/story", "evidence": [
+            {"source": str(i), "snippet": s} for i, s in enumerate(snippets)]}
+        return assess_quality(query, [item]).metrics["相关独立页面"]
+
+    query = "新能源汽车最新政策 2024 42%"
+    assert pages(query, "能源用量 2024：42%") == 1
+    assert pages(query, "汽车销量 2024：42%") == 1
+    assert pages("电动汽车 2024 42%", "汽车销量 2024：42%") == 1
+    for generic in ("最新", "政策"):
+        assert pages(query, f"{generic} 2024：42%") == 0, generic
+    assert pages(query, "能源 2024：142%", "能源 2023：42%") == 0
+    assert pages(query, "能源", "2024：42%") == 0
+    assert pages("最新 如何", "无关报道") == 0
+    assert pages("最新 如何 42%", "无关报道 42%") == 0
+    assert pages("最新政策 42%", "新政 42%") == 0
+    assert pages("600519 价格", "600519 今日收盘价格") == 1
+    assert pages("600519 价格", "600519 的员工人数") == 0
+    assert pages("42%", "比例为 42%") == 1
+
+
+@case("中文相关性：长查询保留整段，有限片段兼顾首尾")
+def t_chinese_term_budget():
+    from .quality import _query_terms
+
+    # 每个相邻字对均不同，避免重复字被去重掩盖了无上限的问题。
+    long_word = "能源" + "".join(chr(0x4e00 + i) for i in range(256)) + "汽车"
+    terms = _query_terms(long_word)
+    assert {long_word, "能源", "汽车"} <= set(terms)
+    assert len(terms) <= 33, len(terms)
+
+
 @case("官方一手来源：同源数下排在前面，且被标注")
 def t_official_boost():
     from .providers.base import merge_results, SearchResult
@@ -2903,6 +3041,172 @@ def _child_sqlite_peer(role: str) -> None:
         assert usage.used("simulated-counter", usage.ANON) == (40, 40)
     finally:
         store.reset_connection()
+
+
+def _reset_cli(*args: str) -> tuple[int, str]:
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+
+    from .cli import main
+
+    output = StringIO()
+    with redirect_stdout(output), redirect_stderr(output):
+        try:
+            main(["reset-cooldown", *args])
+        except SystemExit as exc:
+            return exc.code, output.getvalue()
+    raise AssertionError("CLI 未给出退出码")
+
+
+@case("reset-cooldown：无库不创建；必须点名账号厂商，误传 key 不回显")
+def t_reset_cli_arguments():
+    from . import store
+
+    secret = _fake_key("tavily")
+    for args in ((), ("--apply",), ("all",), ("*",), ("ta?ily",), ("unknown",), ("searxng",),
+                 ("duckduckgo",), (secret, "--apply"), ("tavily", secret), ("--" + secret,), ("tavily", "--app")):
+        code, output = _reset_cli(*args)
+        assert code == 2 and secret not in output, (code, output)
+    missing = store.DB_FILE.parent / "nonexistent-home" / "state.db"
+    with patch.object(store, "DB_FILE", missing):
+        for args in (("baidu",), ("baidu", "--apply")):
+            code, output = _reset_cli(*args)
+            assert code == 0 and "0 条" in output, output
+        assert not missing.parent.exists()
+    assert not store.DB_FILE.exists()
+
+
+@case("reset-cooldown：只读预览看见 WAL；按实际事务清除已移除指纹，保留匿名、用量及过期行")
+def t_reset_cli_transaction():
+    import sqlite3
+    import time
+
+    from . import config, providers, store, usage
+    from .keypool import _fingerprint
+
+    peer = store._connect()
+    assert peer is not None
+    target = "keenable"  # 双通道，但沙盒没有配置它的 key
+    assert not config.get_settings().API_KEYS[target]
+    secret = _fake_key(target)
+    removed = _fingerprint(secret)
+    now = time.time()
+    providers._ANON_COOLDOWN[target] = (config.get_settings().revision, now + 3600)
+    rows = [(target, removed, now + 3600), (target, "expired", now - 1), (target, "bad", "not-a-number"),
+            (target, "infinite", float("inf")), (target, usage.ANON, now + 3600), ("exa", removed, now + 3600)]
+    insert = "INSERT INTO key_state(provider, fingerprint, reset_at, message) VALUES (?, ?, ?, ?)"
+    day, month = store.periods()
+    counters = [("day", day, target, removed, 4), ("month", month, target, removed, 17),
+                ("day", day, target, usage.ANON, 3)]
+    with peer:
+        peer.executemany(insert, [(*row, secret) for row in rows])
+        peer.executemany(store._INSERT_COUNTER, counters)
+    legacy_usage = '{"day":{}}'
+    store.LEGACY_COUNTERS.write_text(legacy_usage, encoding="utf-8")
+
+    connect = sqlite3.connect
+
+    def require_readonly(*args, **kwargs):
+        conn = connect(*args, **kwargs)
+        try:
+            conn.execute("UPDATE key_state SET message=message WHERE 0")
+        except sqlite3.OperationalError as exc:
+            if "readonly" in str(exc).lower():
+                conn.rollback()  # sqlite3 已为失败的 UPDATE 隐式开启事务
+                return conn
+        conn.close()
+        raise AssertionError("预览的 SQLite 连接允许写入")
+
+    # 读连接必须读取未 checkpoint 的已提交 WAL（不能用 immutable 跳过 WAL）。
+    with patch.object(store.sqlite3, "connect", require_readonly):
+        code, output = _reset_cli(target)
+    assert code == 0 and "预览" in output and "1 条" in output and "--apply" in output, output
+    assert removed not in output and secret not in output
+    with peer:
+        peer.execute(insert, (target, "later", now + 3600, secret))  # 预览后新增一条
+    code, output = _reset_cli(target, "--apply")
+    assert code == 0 and "已清除 2 条" in output and removed not in output and secret not in output, output
+    assert set(peer.execute("SELECT provider, fingerprint, reset_at FROM key_state")) == set(rows[1:])
+    assert set(peer.execute("SELECT * FROM usage_counters")) == set(counters)
+    assert store.LEGACY_COUNTERS.read_text(encoding="utf-8") == legacy_usage
+    assert not peer.execute("SELECT 1 FROM legacy_migrations").fetchone()
+    assert providers.anon_cooling(target) > 0
+    code, output = _reset_cli(target, "--apply")
+    assert code == 0 and "已清除 0 条" in output, output
+
+
+@case("reset-cooldown：识别未迁移旧冷却，兼容 0.5.0 无标记表和 0.5.1 已标记未归档")
+def t_reset_cli_legacy():
+    import sqlite3
+    import time
+    from contextlib import closing
+
+    from . import store
+
+    def blocked():
+        for args in (("brave",), ("brave", "--apply")):
+            code, output = _reset_cli(*args)
+            assert code != 0 and "未迁移" in output and "已清除" not in output, output
+
+    legacy = '{"brave":{}}'
+    store.LEGACY_KEY_STATE.write_text(legacy, encoding="utf-8")
+    blocked()
+    assert not store.DB_FILE.exists()
+    with closing(sqlite3.connect(store.DB_FILE)) as peer:
+        for ddl in store._SCHEMA[:2]:  # 0.5.0 只有业务表，版本号为 0
+            peer.execute(ddl)
+        with peer:
+            peer.execute(store._INSERT_COOLDOWN, ("brave", "former", "rate", "", time.time() + 3600))
+        blocked()
+        assert store.LEGACY_KEY_STATE.read_text(encoding="utf-8") == legacy
+        store.LEGACY_KEY_STATE.unlink()
+        code, output = _reset_cli("brave", "--apply")
+        assert code == 0 and "已清除 1 条" in output, output
+        assert peer.execute("PRAGMA user_version").fetchone() == (0,)
+        assert not peer.execute("SELECT 1 FROM sqlite_master WHERE name='legacy_migrations'").fetchone()
+
+        store.LEGACY_KEY_STATE.write_text(legacy, encoding="utf-8")
+        with peer:
+            peer.execute(store._SCHEMA[2])
+            peer.execute("PRAGMA user_version=1")
+            peer.execute("INSERT INTO legacy_migrations VALUES ('usage_counters')")
+            peer.execute(store._INSERT_COOLDOWN, ("brave", "former", "rate", "", time.time() + 3600))
+        blocked()
+        with peer:
+            peer.execute("INSERT INTO legacy_migrations VALUES ('key_state')")
+        code, output = _reset_cli("brave", "--apply")
+        assert code == 0 and "已清除 1 条" in output, output
+        assert store.LEGACY_KEY_STATE.read_text(encoding="utf-8") == legacy
+
+
+@case("reset-cooldown：写锁、提交失败和损坏库返回非零，不假报已清除")
+def t_reset_cli_storage_errors():
+    import sqlite3
+    import time
+    from contextlib import closing
+
+    from . import store
+
+    def failed(*args):
+        code, output = _reset_cli("exa", *args)
+        assert code == 1 and "失败" in output and "已清除" not in output, output
+
+    connect = sqlite3.connect
+    with closing(connect(store.DB_FILE)) as peer:  # rollback journal 下读锁允许 DELETE，但阻止 COMMIT
+        peer.execute(store._SCHEMA[0])
+        with peer:
+            peer.execute(store._INSERT_COOLDOWN, ("exa", "former", "rate", "", time.time() + 3600))
+        with patch.object(store.sqlite3, "connect", lambda *a, **kw: connect(*a, **{**kw, "timeout": 0})):
+            for begin in ("BEGIN IMMEDIATE", "BEGIN"):
+                peer.execute(begin)
+                assert peer.execute("SELECT count(*) FROM key_state").fetchone() == (1,)
+                failed("--apply")
+                peer.rollback()
+                assert peer.execute("SELECT count(*) FROM key_state").fetchone() == (1,)
+    store.DB_FILE.write_bytes(b"not a database")
+    failed()
+    failed("--apply")
+    assert store.DB_FILE.read_bytes() == b"not a database"
 
 
 @case("WAL 模式已开启")

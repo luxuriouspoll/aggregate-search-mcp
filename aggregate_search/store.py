@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass, field
 from decimal import Decimal, DecimalException
 from pathlib import Path
@@ -339,6 +340,45 @@ def upsert_key_state(provider: str, fp: str, code: str, message: str, reset_at: 
                 """, (provider, fp, code, message[:200], reset_at, math.inf))
         except sqlite3.Error as exc:
             log(f"冷却状态写入失败：{exc}")
+
+
+class LegacyCooldownPending(RuntimeError):
+    """未导入的旧冷却可能在下一次常规访问时重新生效。"""
+
+
+def _check_legacy_cooldown(conn: sqlite3.Connection | None) -> None:
+    try:
+        LEGACY_KEY_STATE.stat()
+    except FileNotFoundError:
+        return
+    # 0.5.0 没有标记表；0.5.1 已提交标记但归档失败时，原文件不会再次导入。
+    if (conn is not None and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_migrations'"
+    ).fetchone() and conn.execute("SELECT 1 FROM legacy_migrations WHERE name='key_state'").fetchone()):
+        return
+    raise LegacyCooldownPending("发现未迁移的旧冷却文件；请先用 aggregate-search status 完成正常状态迁移，再重试。")
+
+
+def reset_provider_cooldown(provider: str, *, apply: bool = False) -> int:
+    """返回本次预览或已提交删除的有效冷却数。专用连接不建库、不升级、不迁移。"""
+    try:
+        DB_FILE.stat()
+    except FileNotFoundError:
+        _check_legacy_cooldown(None)
+        return 0
+
+    mode = "rw" if apply else "ro"  # 不用 immutable：必须看到其它连接刚提交的 WAL。
+    uri = f"{DB_FILE.absolute().as_uri()}?mode={mode}"
+    with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
+        _check_legacy_cooldown(conn)
+        # 与 _active_reset 一致，只计有限的未来时间；anon 是匿名记账的保留名。
+        where = (" WHERE provider = ? AND fingerprint <> 'anon' AND typeof(reset_at) IN ('integer','real')"
+                 " AND reset_at > ? AND reset_at < ?")
+        params = (provider, time.time(), math.inf)
+        if apply:
+            return conn.execute("DELETE FROM key_state" + where, params).rowcount
+        return conn.execute("SELECT count(*) FROM key_state" + where, params).fetchone()[0]
 
 
 def delete_key_state(provider: str, fp: str) -> None:

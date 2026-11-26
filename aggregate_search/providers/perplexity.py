@@ -18,8 +18,8 @@ from .base import (
     SearchResult,
     as_dict,
     as_items,
-    brief,
     date_metadata,
+    normalized_urls,
     post_json,
     query_with_sites,
     text_of,
@@ -37,8 +37,8 @@ def _perplexity_filters() -> dict:
     if recency:
         extra["search_recency_filter"] = recency
     domains = wants_domains()
-    if domains:
-        extra["search_domain_filter"] = list(domains[:10])
+    if domains and len(domains) <= 10:
+        extra["search_domain_filter"] = list(domains)
     return extra
 
 
@@ -54,43 +54,52 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
                     "role": "system",
                     "content": "Be precise and concise. Answer in the user's language.",
                 },
-                {"role": "user", "content": query},
+                # 超过原生名单的预算时整组改用 site:；不静默丢弃第 11–20 个站点。
+                {"role": "user", "content": query_with_sites(query) if len(wants_domains()) > 10 else query},
             ],
             "return_citations": True,
             "return_related_questions": False,
             **_perplexity_filters(),
         },
     )
-    choices = as_items(data, "choices")
-    if not choices:
-        raise ProviderError(f"无 choices: {brief(data)}")
-    answer = text_of(as_dict(choices[0].get("message")).get("content"))
-    citations = data.get("citations")
-    citations = [c for c in citations if isinstance(c, str)] if isinstance(citations, list) else []
-    if not answer and not citations:
-        raise ProviderError("Perplexity 未返回答案或引用")
+    return _evidence(data, query, max_results)
 
+
+def _evidence(data: dict, query: str, limit: int) -> list[SearchResult]:
     results: list[SearchResult] = []
-    if answer:
-        results.append(
-            SearchResult(
-                source="perplexity",
-                url=f"https://www.perplexity.ai/search?q={quote(query, safe='')}",
-                title=f"[Perplexity 摘要] {query}",
-                snippet=answer[:1200],
-                rank=0,
-            )
-        )
-    # 引用条数不要顶破 max_results，也别和答案条重复
-    remaining = max(0, max_results - len(results))
-    for i, url in enumerate(citations[:remaining]):
-        results.append(
-            SearchResult(
-                source="perplexity",
-                url=url,
-                title="",
-                snippet="",
-                rank=len(results),
-            )
-        )
+    seen: set[str] = set()
+
+    def add(url, title="", snippet="", published="", dates=()) -> None:
+        url = text_of(url)
+        key, _ = normalized_urls(url)
+        if not key or key in seen or len(results) >= limit:
+            return
+        seen.add(key)
+        results.append(SearchResult(
+            source="perplexity", url=url, title=text_of(title), snippet=text_of(snippet)[:1200],
+            rank=len(results), published=text_of(published), dates=dates,
+        ))
+
+    for page in as_items(data, "search_results"):
+        # Sonar 的 ApiPublicSearchResult.date 明指发布日期；last_updated 仅作元数据。
+        add(page.get("url"), page.get("title"), page.get("snippet"), page.get("date"),
+            date_metadata(last_updated=page.get("last_updated")))
+        if len(results) >= limit:
+            return results
+
+    choices = as_items(data, "choices")
+    answer = text_of(as_dict(choices[0].get("message")).get("content")) if choices else ""
+    summary_url = f"https://www.perplexity.ai/search?q={quote(query, safe='')}"
+    summary_title = f"[Perplexity 摘要] {query}"
+    if answer and not results and not (wants_domains() or wants_time("perplexity")):
+        add(summary_url, summary_title, answer)  # 无筛选的旧版响应仍把答案放在首条
+    citations = data.get("citations")
+    for url in citations if isinstance(citations, list) else ():
+        add(url)
+        if len(results) >= limit:
+            break
+    if answer and len(results) < limit:
+        add(summary_url, summary_title, answer)
+    if not results:
+        raise ProviderError("Perplexity 未返回可用网页、引用或答案")
     return results

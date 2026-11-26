@@ -311,7 +311,7 @@ def _host_in_domains(host: str, domains: Iterable[str]) -> bool:
     return any(host == domain or host.endswith("." + domain) for domain in domains)
 
 
-def _normalized_urls(url: str) -> tuple[str, str]:
+def normalized_urls(url: str) -> tuple[str, str]:
     """返回去重键与证据链接；证据链接不能改变原始主机（尤其是 www. 限定）。"""
     parsed = _url_parts(url)
     if parsed is None:
@@ -340,7 +340,7 @@ def _normalized_urls(url: str) -> tuple[str, str]:
 def normalize_url(url: str) -> str:
     """去重键：小写 scheme/host、去 www、默认端口、跟踪参数和纯锚点，排序查询参数。"""
     url = (url or "").strip()
-    return _normalized_urls(url)[0] or url  # 非法或非 HTTP URL 原样交给调用方
+    return normalized_urls(url)[0] or url  # 非法或非 HTTP URL 原样交给调用方
 
 
 def _clean_text(text: str) -> str:
@@ -458,7 +458,7 @@ def merge_results(groups: dict[str, list[SearchResult]]) -> list[dict]:
     merged: dict[str, dict] = {}
     for results in groups.values():
         for r in results:
-            key, url = _normalized_urls(text_of(r.url))
+            key, url = normalized_urls(text_of(r.url))
             if not key:
                 continue
             title, snippet = _clean_text(r.title), _clean_text(r.snippet)
@@ -782,6 +782,14 @@ _ISO_DATETIME = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}"
     r"(?::[0-9]{2}(?:[.,][0-9]+)?)?(?:[Zz]|[+-][0-9]{2}:?[0-9]{2})"
 )
+# email.utils 本身也接受模糊/过时格式；先限制词形、完整时区和偏移分钟。
+_RFC_PUBLICATION = re.compile(
+    r"(?:(?P<weekday>[a-z]{3}),[ \t]+)?[0-9]{1,2}[ \t]+"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[ \t]+(?:19|[2-9][0-9])[0-9]{2}[ \t]+"
+    r"[0-9]{2}:[0-9]{2}(?::[0-9]{2})?[ \t]+(?:GMT|UTC|(?!-0000)[+-](?:[01][0-9]|2[0-3])[0-5][0-9])",
+    re.I | re.ASCII,
+)
+_ZH_DATE = re.compile(r"([0-9]{4})年([0-9]{1,2})月([0-9]{1,2})日")
 
 
 def _parse_publication_date(raw: str) -> date | datetime | None:
@@ -795,6 +803,16 @@ def _parse_publication_date(raw: str) -> date | datetime | None:
             value = re.sub(r"[.,]([0-9]+)", lambda m: "." + m[1][:6].ljust(6, "0"), value)
             value = re.sub(r"([+-][0-9]{2})([0-9]{2})$", r"\1:\2", value)
             return datetime.fromisoformat(value).astimezone(timezone.utc)
+        if zh := _ZH_DATE.fullmatch(value):
+            return date(*map(int, zh.groups()))
+        if rfc := _RFC_PUBLICATION.fullmatch(value):
+            from email.utils import parsedate_to_datetime
+
+            stamp = parsedate_to_datetime(value)
+            weekday = rfc["weekday"]
+            if weekday and weekday.lower() != ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[stamp.weekday()]:
+                return None
+            return stamp.astimezone(timezone.utc)
     except (OverflowError, ValueError):
         pass
     return None

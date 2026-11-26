@@ -1,23 +1,25 @@
 # aggregate-search 使用指南
 
-适用于 **v0.5.1**。本指南从升级或安装开始，走到在 MCP 客户端里完成第一次搜索。想先看项目原理、支持的厂商和完整配置，见 [项目介绍（README）](../README.md)。
+适用于 **v0.5.2**。本指南从升级或安装开始，走到在 MCP 客户端里完成第一次搜索。想先看项目原理、支持的厂商和完整配置，见 [项目介绍（README）](../README.md)。
 
 ## 1. 已有 0.5.0：不删旧 MCP，就地升级
+
+这套步骤同样适用于从 0.5.1 升级。
 
 如果客户端已经把启动命令设成 `aggregate-search`，**保留原来的 MCP 注册项**。升级只替换程序，不需要重新填 Key，也不要删除 `.env`、`keys.json`、`state.db` 或 `usage.jsonl`。
 
 1. 在 ZCode 等客户端里停用或断开 `aggregate-search`。Windows 上如果断开后仍占用文件，退出使用这个 MCP 的客户端再升级；远程 HTTP 常驻实例则要停掉实际的服务进程。
-2. 在 PowerShell 进入**已更新到 0.5.1 的本地仓库根目录**（里面有 `pyproject.toml`）。把下面示例路径换成你自己的：
+2. 在 PowerShell 进入**已更新到 0.5.2 的本地仓库根目录**（里面有 `pyproject.toml`）。把下面示例路径换成你自己的：
 
    ```powershell
    Set-Location 'D:\projects\aggregate-search-mcp'
    uv tool install --force --reinstall .
    ```
 
-   如果不使用本地源码，而是想安装 GitHub 上的版本，用下面这条替代；不要两条都执行。`@master` 跟随默认分支，不固定版本。
+   如果不使用本地源码，而是直接安装 GitHub 上的发布版，用下面这条替代（不要两条都执行；想跟随开发主分支可把 `@v0.5.2` 换成 `@master`）：
 
    ```powershell
-   uv tool install --force --reinstall --upgrade 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@master'
+   uv tool install --force --reinstall 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.2'
    ```
 
 3. **先在终端验收，再回客户端重连原来的注册项**：
@@ -29,7 +31,7 @@
    aggregate-search status
    ```
 
-   该版本应打印 `aggregate-search 0.5.1`；`path` 应是原来的配置目录；`selftest` 应全部通过；`status` 用来确认原配置仍被读取，并查看厂商、用量、硬锁和代理模式。`selftest` 不联网也不读真实配置；`status` 不向厂商发请求，但可能在本地初始化或迁移状态库。
+   该版本应打印 `aggregate-search 0.5.2`；`path` 应是原来的配置目录；`selftest` 应全部通过；`status` 用来确认原配置仍被读取，并查看厂商、用量、硬锁和代理模式。`selftest` 不联网也不读真实配置；`status` 不向厂商发请求，但可能在本地初始化或迁移状态库。
 
 > **什么时候才需要改 MCP 注册项？** 如果旧命令是 `uvx`，它不会使用刚装好的 `aggregate-search`：可以更新原有 `uvx` 指向的 Git 版本，或直接把原注册项改成 `aggregate-search`。如果客户端写死了旧虚拟环境的路径，也只需把命令改为新版入口；无需先删再建。Windows 用 `where.exe aggregate-search` 查看程序路径。使用 `pipx` 或自建虚拟环境安装过的，优先用原安装工具更新，避免 PATH 上同时出现两个版本。
 
@@ -105,6 +107,15 @@ MONTHLY_LIMITS=tavily:300
 ```
 
 上限按**每个 Key**计。运行中取消某家上限请显式写 `厂商:0`，不要靠删行；不要删除 `state.db` 来清冷却，否则也会丢失用量账本。更多细节见 [省额度与防超支](../README.md#省额度与防超支) 和 [配置热加载](../README.md#配置热加载)。
+
+**Key 仍在冷却怎么办？** 普通网络失败不会自动把账号 Key 封为无效；先在常驻服务里调用 `web_status`，区分匿名限流、账号冷却和用量达限。只有确认账号问题已解决时才运行下面的本地命令：
+
+```powershell
+aggregate-search reset-cooldown tavily           # 只预览，不修改
+aggregate-search reset-cooldown tavily --apply   # 确认后才执行
+```
+
+它按厂商清理本地仍有效的账号 Key 冷却，包括已移出配置的旧 Key 指纹；不能恢复上游额度，也不会清匿名冷却或日/月用量。CLI `status` 是新进程；要确认长驻 MCP 实际保留的限额，请看该实例的 `web_status`。
 
 ## 5. 常见卡点
 

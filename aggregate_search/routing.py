@@ -27,7 +27,7 @@ def _load_stats() -> dict[str, dict]:
 
 
 # 易歧义短词后面跟这些内容时，才算在说这门技术
-_TECH_SUFFIX = r"(?=\s*(?:\d|语言|编程|开发者|并发|泛型|接口|goroutine|module|test|语言))"
+_TECH_SUFFIX = r"(?=\s*(?:\d|语言|编程|开发者|并发|泛型|接口|goroutine|module|test))"
 
 _REGION_ALIASES: dict[str, str] = {
     "": "auto", "auto": "auto", "自动": "auto",

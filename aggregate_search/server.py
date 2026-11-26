@@ -1196,7 +1196,8 @@ def status_text(usage_days: int | None = 0) -> str:
         if settings.AUTO_ESCALATE_MAX
         else f"- auto 不自动补搜（AUTO_ESCALATE_MAX=0）；escalate 每次补 {settings.ESCALATE_COUNT} 家"
     )
-    lines.append(f"- 本地用量上限: {_limits_text()}")
+    lines.append(f"- 本进程生效的用量上限（每个 key）: {_limits_text()}")
+    lines.append("- CLI status 读取新进程的配置；常驻服务可能保留热加载前的限额，请以该服务的 web_status 为准。")
     lines.append("")
 
     lines.append("### 网络")

@@ -4,6 +4,7 @@
     aggregate-search init           生成全局配置目录和 .env 模板
     aggregate-search path           显示配置目录位置
     aggregate-search status         查看各家 key、冷却与用量
+    aggregate-search reset-cooldown 厂商 [--apply]  预览或清除该厂商的本地账号冷却
     aggregate-search search 关键词   直接搜一次（--mode / --region / --providers / --time-range / --domains）
     aggregate-search fetch URL      抓取网页正文
     aggregate-search check          发出真实请求，检查启用的搜索通道
@@ -107,6 +108,33 @@ def cmd_status(days: int) -> int:
     from .server import status_text
 
     print(status_text(days))
+    return 0
+
+
+def cmd_reset_cooldown(provider: str, *, apply: bool) -> int:
+    import sqlite3
+
+    from . import config, store
+    from .providers import REGISTRY
+
+    provider = provider.lower()
+    # API_KEYS 的键是支持账号的厂商，空池也保留；不能只检查现有池中的指纹。
+    if provider not in REGISTRY or provider not in config.get_settings().API_KEYS:
+        print("请指定一个支持账号 key 的已知厂商名，不接受 all、通配符或明文 key。", file=sys.stderr)
+        return 2
+    try:
+        count = store.reset_provider_cooldown(provider, apply=apply)
+    except store.LegacyCooldownPending as exc:
+        print(f"[未清除] {exc}", file=sys.stderr)
+        return 1
+    except (OSError, sqlite3.Error) as exc:
+        detail = getattr(exc, "sqlite_errorname", type(exc).__name__)
+        print(f"[失败] 无法访问状态库或完成事务（{detail}）；请检查占锁、权限或数据库完整性。", file=sys.stderr)
+        return 1
+    if apply:
+        print(f"{provider}：已清除 {count} 条本地账号 key 有效冷却。")
+    else:
+        print(f"[预览] {provider}：{count} 条本地账号 key 有效冷却。未更改；加 --apply 才清除。")
     return 0
 
 
@@ -248,8 +276,15 @@ def cmd_selftest(child: bool) -> int:
     return done.returncode
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+class _CooldownParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        # argparse 默认会复述多余参数；有人把密钥错当参数时不能写进终端日志。
+        super().error("请指定一个厂商名；可选参数仅 --apply（查看帮助用 --help）。")
+
+
+def build_parser(*, private_errors: bool = False) -> argparse.ArgumentParser:
+    parser_type = _CooldownParser if private_errors else argparse.ArgumentParser
+    parser = parser_type(
         prog="aggregate-search",
         description="聚合联网搜索 MCP。不带任何参数运行即启动 MCP 服务（stdio），供 MCP 客户端调用。",
     )
@@ -270,6 +305,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", help="查看各家 key、冷却、用量和抓取顺序")
     p.add_argument("--usage", dest="days", type=int, default=0, metavar="天数", help="附带近 N 天使用记录")
+
+    p = sub.add_parser("reset-cooldown", help="预览指定厂商的账号 key 冷却（--apply 才清除）", allow_abbrev=False)
+    p.add_argument("provider", metavar="厂商", help="一个支持账号 key 的厂商名，例如 tavily；不接受明文 key")
+    p.add_argument("--apply", action="store_true", help="清除当前有效的本地账号冷却，不改变日/月计数或匿名冷却")
 
     p = sub.add_parser("search", help="直接搜索一次")
     p.add_argument("query", nargs="+", help="搜索关键词")
@@ -313,7 +352,7 @@ def main(argv: list[str] | None = None) -> None:
         serve(transport=transport, host=host, port=port)
         return
 
-    args = build_parser().parse_args(argv)
+    args = build_parser(private_errors=argv[0] == "reset-cooldown").parse_args(argv)
     command = args.command
     if command == "init":
         code = cmd_init(args.source)
@@ -321,6 +360,8 @@ def main(argv: list[str] | None = None) -> None:
         code = cmd_path()
     elif command == "status":
         code = cmd_status(args.days)
+    elif command == "reset-cooldown":
+        code = cmd_reset_cooldown(args.provider, apply=args.apply)
     elif command == "usage":
         code = cmd_usage(args.days)
     elif command == "search":

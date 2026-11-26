@@ -1,25 +1,30 @@
 # aggregate-search-mcp
 
-把十几家联网搜索服务打成一个 MCP，给 AI 助手用。
+[![CI](https://github.com/luxuriouspoll/aggregate-search-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/luxuriouspoll/aggregate-search-mcp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/luxuriouspoll/aggregate-search-mcp)](https://github.com/luxuriouspoll/aggregate-search-mcp/releases)
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-默认优先查**免费的匿名搜索源**，覆盖不足才补查其他厂商；同一家可配多个 key 自动轮换。各家的结果去重后合成一份带来源的证据。
+**免费优先的多源聚合联网搜索 MCP 服务** —— 把 19 家国内外搜索与网页抓取通道收拢成统一入口，交给 Claude Code、Codex、ZCode、Cursor 等 AI 客户端直接调用。
 
+[快速开始](#快速开始) · [新手与升级指南](docs/usage-guide.md) · [接入客户端](#接入-mcp-客户端) · [支持厂商](#厂商注册地址) · [版本发布](https://github.com/luxuriouspoll/aggregate-search-mcp/releases) · [变更记录](CHANGELOG.md)
+
+```text
+用户提问 ──▶ 1. 免费匿名源先查（0 成本） ──▶ 2. 本地站点/时间过滤与去重
+         ──▶ 3. 覆盖度门禁判断 ──▶ 4. 不足才按国内外路由补搜 3 家 ──▶ 5. 输出带来源与成本账单的合并证据
 ```
-用户问题 → 优先查 3 家匿名源 → 本地检查覆盖度 → 不够才补查（默认 3 家）→ 合并证据 → 交给 AI 判断
-```
 
-- **装一次，全局可用**：一条命令 `aggregate-search`，配置文件放在用户目录，和代码放哪个文件夹无关
-- **三个工具**：`web_search`（搜索）、`web_fetch`（抓网页正文）、`web_status`（看状态）
-- **19 家厂商**，一个 key 都不配也能用
-- **依赖很少**：Python 3.10+，依赖 `mcp` 和 `httpx`
-- **两种 MCP 传输**：默认用 stdio，也可启用 [Streamable HTTP](#可选-http-传输)
-- **仓库里没有任何真实 key**
+| 核心特性 | 说明 |
+|---|---|
+| **零 Key 开箱即用** | 内置 Parallel、Keenable、AnySearch 匿名通道，不申请任何 API Key 也能立刻联网搜索与抓正文 |
+| **按需补搜省额度** | 简单问题不烧账号额度；覆盖不足才按「国内 / 国际 / 混合」软路由补查 3 家不同厂商 |
+| **多 Key 轮换与硬限额** | 同厂商多 Key 自动轮询与故障冷却；SQLite WAL 多进程原子计费，支持单 Key 日/月上限与服务端禁 Key 硬锁 |
+| **高信噪比与安全隔离** | 同网址跨源合并、近似转载折叠、官方一手来源加权、严格发布时间核验；外部内容包裹 `<untrusted_content>` 防提示词注入 |
+| **轻量易部署** | 仅依赖 `mcp` 与 `httpx`（Python 3.10+）；一次全局安装到处可用，同时支持本机 `stdio` 与远程 [Streamable HTTP](#可选-http-传输) |
 
-**已在用 0.5.0？** 不用删旧 MCP，也不用重填 Key。按 [使用指南 · 就地升级](docs/usage-guide.md#1-已有-050不删旧-mcp就地升级) 更新程序，验收后重连原来的注册项。
-
-**第一次来？** 先看 [使用指南](docs/usage-guide.md)，跟着装好命令，在 ZCode 或其它 MCP 客户端完成第一次匿名实搜。版本变化见 [CHANGELOG](CHANGELOG.md)。
-
-> 各家的免费额度和价格会变。本文的额度信息来自 2026-11 查到的官方页面，注册前请以厂商控制台为准。
+> **已在用 0.5.0 或 0.5.1？** 不用删旧 MCP，也不用重填 Key。按 [使用指南 · 就地升级](docs/usage-guide.md#1-已有-050不删旧-mcp就地升级) 更新程序，验收后重连原来的注册项。
+>
+> **第一次使用？** 推荐直接看 [手把手使用指南](docs/usage-guide.md)，几分钟内完成安装和第一次匿名实搜。各家免费额度以厂商控制台实时说明为准。
 
 ---
 
@@ -75,19 +80,17 @@
 
 ### 第 1 步：安装命令
 
-从 GitHub 默认分支首次安装：
+推荐从固定发布标签安装（也可从 [Releases](https://github.com/luxuriouspoll/aggregate-search-mcp/releases) 下载 `.whl` 安装）：
 
 ```bash
-uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@master'
+uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.2'
 ```
 
-也可克隆仓库，在根目录用 `uv tool install .` 或 `pipx install .`；在专用虚拟环境中可用 `python -m pip install .`。安装后验证版本：
+想跟随开发主分支可用 `@master`；也可克隆仓库后在根目录用 `uv tool install .` 或 `pipx install .`（虚拟环境内用 `python -m pip install .`）。安装后验证版本：
 
 ```bash
-aggregate-search --version          # 此版本显示 aggregate-search 0.5.1
+aggregate-search --version          # 显示 aggregate-search 0.5.2
 ```
-
-`@master` 跟随分支更新，不是固定版本。需要可重复安装时，可将 `@master` 换成已核实的完整提交 SHA。这里使用 GitHub 源码安装，不依赖 PyPI 发布。
 
 > 提示找不到命令？说明安装目录不在 PATH 里。运行 `uv tool update-shell`，然后**重新打开终端**。
 
@@ -338,6 +341,8 @@ Parallel、Keenable、AnySearch 不配 key 就能搜。即使配了，`auto` 的
 
 本地会复核站点和日期条件；近似去重开启时，也会先折叠转载。这些步骤都在覆盖度判断之前完成，不合条件或重复的页面不会抬高 `auto` 的覆盖度。
 
+发布日期支持 ISO 日期、中文年月日（如 `2026年11月25日`），以及带明确时区的 ISO 或 RFC 时间戳。不会把无时区时间戳、相对时间、网页更新时间或爬取时间换算成发布日期。Perplexity 是按厂商契约处理的例子：[Sonar 的 OpenAPI](https://docs.perplexity.ai/openapi.json) 明确区分 `search_results[].date`（发布日期）与 `last_updated`（更新时间）；其他厂商仅名为 `date` 的字段不能据此类推。
+
 ### `web_fetch` — 抓网页正文
 
 ```json
@@ -387,7 +392,7 @@ MONTHLY_LIMITS=tavily:900,exa:900
 - **百度千帆内置 `baidu:90`**（官方每日免费 100 次，留了余量）。不想要就写 `baidu:0`
 - 同一配置目录下的服务进程通过 `state.db`（SQLite WAL）共享用量和冷却状态。设了上限的 key 要先在同一事务内检查日 / 月用量并占额，才能发出请求，避免并发请求超用同一份额度
 - 计数针对本服务发出的请求，不是厂商的账单；它管不到其它应用或使用其他配置目录的服务，不能替代厂商控制台的额度告警
-- 冷却到期自动解除。不要为解除冷却删除 `state.db`，否则日 / 月计数也会丢失
+- 冷却到期自动解除。确认上游账号已恢复且不想等到期时，用 `aggregate-search reset-cooldown tavily` 预览目标厂商，再用 `aggregate-search reset-cooldown tavily --apply` 清除当时仍有效的账号冷却。**不要删除 `state.db`**：重置冷却不会清账，已达本地上限的 Key 仍不可用。
 
 ### 本地使用记录
 
@@ -421,7 +426,8 @@ aggregate-search usage 7     # 近 7 天：各家调用次数、成功率、平�
 | `aggregate-search init` | 生成配置目录和 `.env` 模板（已有的不覆盖） |
 | `aggregate-search init --from 路径` | 从已有的 `.env` 导入 |
 | `aggregate-search path` | 显示配置目录 |
-| `aggregate-search status` | 配置告警、各家 key、冷却、用量、抓取顺序、网络 |
+| `aggregate-search status` | 显示这个新进程读取的配置、Key、用量和抓取顺序；确认常驻服务当前限额请用 `web_status` |
+| `aggregate-search reset-cooldown <厂商> [--apply]` | 默认只预览；加 `--apply` 才清除该厂商有效的账号 Key 冷却，包括已移出配置的旧指纹。不会清除日/月用量或匿名限流 |
 | `aggregate-search search 关键词` | 搜一次。可加 `--mode`、`--region`、`--providers`、`--max`、`--total`、`--time-range`、`--domains` |
 | `aggregate-search fetch URL [后端]` | 抓一个网页 |
 | `aggregate-search check [关键词]` | 发送真实请求逐家诊断；带 key 的请求会计入用量，开启 `SEARCH_NO_ACCOUNT_KEYS=true` 后只测匿名通道 |
@@ -684,6 +690,8 @@ aggregate_search/
     base.py         HTTP 封装、脱敏、URL 归一化、证据合并
     *.py            19 个厂商适配器
   templates/        .env 与 keys.json 模板
+docs/usage-guide.md 安装、升级与首次实搜手把手指南
+scripts/            发行包（sdist / wheel）完整性与隐私检查脚本
 server.py           旧启动方式的兼容入口
 mcp_handshake_demo.py   手动演示一次完整的 MCP 对话
 ```
@@ -741,7 +749,7 @@ python -m venv .venv
 
 每个版本改了什么，见 [CHANGELOG.md](CHANGELOG.md)。
 
-`0.5.1` 将默认免费模式与服务端禁用账号 key 的硬锁分开，并修正热加载、时间与站点筛选、Parallel 的匿名 / 认证隔离及多进程限额。`0.5.0` 加入了 HTTP 传输、抓取缓存和 SQLite 状态库，并修复了博查响应解析及智谱、元宝的额度错误识别。
+`0.5.2` 修复 Perplexity 网页证据丢失和中文关键词漏配，扩大可靠发布日期的格式支持，增加可预览的本地账号冷却维护命令。`0.5.1` 将默认免费模式与服务端硬锁分开，修正了热加载、筛选、会话隔离及多进程限额。
 
 ## 许可
 
