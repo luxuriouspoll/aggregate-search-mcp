@@ -1,6 +1,18 @@
+# 密钥与本机状态：正式位置是 ~/.aggregate-search/，这里只是防止旧位置的文件被误提交
 .env
 keys.json
 .key-state.json
+.env.*
+key-state.json
+usage.jsonl
+usage.jsonl.1
+usage-counters.json
+*.tmp
+
+# Python
 .venv/
 __pycache__/
 *.pyc
+build/
+dist/
+*.egg-info/

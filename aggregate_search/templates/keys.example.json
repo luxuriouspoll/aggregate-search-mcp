@@ -1,0 +1,20 @@
+{
+  "_说明": "可选：想把多个 key 集中放在一个文件里，就把本文件复制为同目录下的 keys.json 再填写。.env 或环境变量里已经配了某家的 key 时，以那边为准。下面全是占位符。",
+  "tavily": ["tvly-your-first-key", "tvly-your-second-key"],
+  "exa": ["your-exa-key"],
+  "firecrawl": ["fc-your-key"],
+  "jina": ["jina_your-key"],
+  "querit": ["your-querit-key"],
+  "volcengine": ["your-volcengine-key"],
+  "baidu": ["your-baidu-qianfan-key"],
+  "yuanbao": ["your-yuanbao-search-key"],
+  "zhipu": ["your-zhipu-key"],
+  "bocha": ["your-bocha-key"],
+  "parallel": ["your-parallel-key-optional"],
+  "keenable": ["your-keenable-key-optional"],
+  "anysearch": ["your-anysearch-key-optional"],
+  "youcom": ["your-youcom-key-optional"],
+  "ollama": [],
+  "brave": [],
+  "perplexity": []
+}

@@ -1,0 +1,306 @@
+"""命令行入口。
+
+    aggregate-search                启动 MCP 服务（stdio）—— MCP 客户端里配的就是这条命令
+    aggregate-search init           生成全局配置目录和 .env 模板
+    aggregate-search path           显示配置目录位置
+    aggregate-search status         查看各家 key、冷却与用量
+    aggregate-search search 关键词   直接搜一次（--mode / --region / --providers）
+    aggregate-search fetch URL      抓取网页正文
+    aggregate-search check          让每家各发一次真实请求，检查连通性
+    aggregate-search usage [天数]    查看本地使用记录汇总
+    aggregate-search selftest       离线自测（不联网、不读取也不改动你的配置）
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from . import __version__
+
+
+def _prepare_streams() -> None:
+    """把输出流整理好，必须在导入其它模块之前做（配置告警在导入时就会打印）。
+
+    - 有些宿主不给子进程 stderr（sys.stderr 为 None）。这时 print(file=None) 会改写到 stdout，
+      而 stdout 是 MCP 的协议通道——所以先接一个黑洞上去。
+    - Windows 下管道 / 重定向默认 GBK，中文会乱码或直接报编码错误，统一成 UTF-8。
+    """
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _template(name: str) -> str:
+    from importlib import resources
+
+    return resources.files("aggregate_search").joinpath("templates", name).read_text(encoding="utf-8")
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """新建一个只有自己能读写的文件（里面是密钥）。已存在则报错，绝不覆盖。"""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+
+
+def cmd_init(source: str | None) -> int:
+    """建好配置目录；没有 .env 就生成一份（有旧文件则原样迁过来）。已有的不动。"""
+    from . import config
+
+    home = config.CONFIG_DIR
+    config.ensure_home()
+    env_file = config.ENV_FILE
+    print(f"配置目录: {home}")
+
+    if source:
+        origin = Path(source).expanduser()
+        if not origin.is_file():
+            print(f"[失败] 找不到要导入的文件: {origin}")
+            return 1
+    else:
+        origin = config.legacy_file(".env")
+
+    if env_file.exists():
+        print(f"[保留] 已有配置文件，未改动: {env_file}")
+        if origin and origin.resolve() != env_file.resolve():
+            print(f"       （没有覆盖它；如确实要改用 {origin}，请先自行备份并删除上面的文件）")
+    elif origin:
+        _write_private(env_file, origin.read_bytes())
+        print(f"[迁移] 已把 {origin} 复制为 {env_file}")
+        print("       旧文件仍在原处，确认新位置可用后可以自行删除。")
+    else:
+        _write_private(env_file, _template("env.example").encode("utf-8"))
+        print(f"[新建] 已生成配置模板: {env_file}")
+
+    legacy_keys = config.legacy_file("keys.json")
+    if legacy_keys and not config.KEYS_FILE.exists() and not source:
+        _write_private(config.KEYS_FILE, legacy_keys.read_bytes())
+        print(f"[迁移] 已把 {legacy_keys} 复制为 {config.KEYS_FILE}")
+    sample = home / "keys.example.json"
+    if not sample.exists():
+        sample.write_text(_template("keys.example.json"), encoding="utf-8")
+
+    print()
+    print("接下来：")
+    print(f"  1. 用记事本等编辑器打开 {env_file}，把要用的厂商那一行去掉开头的 # 并填入 key")
+    print("     （一个 key 都不填也能用：Parallel / Keenable / AnySearch 匿名免费）")
+    print("  2. 运行 aggregate-search status 确认哪些厂商已启用")
+    print("  3. 改完配置后，在 MCP 客户端里重连 aggregate-search 才会生效")
+    return 0
+
+
+def cmd_path() -> int:
+    from . import config
+
+    print(config.CONFIG_DIR)
+    return 0
+
+
+def cmd_status(days: int) -> int:
+    from .server import status_text
+
+    print(status_text(days))
+    return 0
+
+
+def cmd_usage(days: int) -> int:
+    from . import usage
+
+    print(usage.summarize(days))
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    from .server import web_search
+
+    providers = [p for p in (args.providers or "").replace("，", ",").split(",") if p.strip()]
+    text = asyncio.run(web_search(
+        " ".join(args.query),
+        max_results=args.max,
+        providers=providers or None,
+        total_results=args.total,
+        search_mode=args.mode,
+        region=args.region,
+    ))
+    print(text)
+    return 0
+
+
+def cmd_fetch(url: str, backend: str) -> int:
+    from .server import web_fetch
+
+    print(asyncio.run(web_fetch(url, backend)))
+    return 0
+
+
+async def _check(query: str) -> int:
+    from .config import FREE_PROVIDERS
+    from .providers import (
+        REGISTRY,
+        can_anonymous,
+        enabled_search_providers,
+        has_keys,
+        pool_status,
+        run_search,
+    )
+
+    enabled = enabled_search_providers()
+    anonymous = [n for n in FREE_PROVIDERS if n in REGISTRY and can_anonymous(n)]
+    anonymous += [n for n in enabled if not has_keys(n) and n not in anonymous]
+    keyed = [n for n in enabled if has_keys(n)]
+    print(f"测试查询: {query}")
+    print("每家会各发一次真实请求（带 key 的会消耗 1 次额度）。\n")
+
+    failed = 0
+    for title, names, force_anonymous in (
+        ("匿名通道（不带 key）", anonymous, True),
+        ("账号 key 通道", keyed, False),
+    ):
+        print(f"== {title} ==")
+        if not names:
+            print("（没有可测的厂商）\n")
+            continue
+        _, _, records = await run_search(names, query, 3, True if force_anonymous else ())
+        for record in records:
+            seconds = f"{record.ms / 1000:.1f}s"
+            if record.ok:
+                print(f"[OK]   {record.label}: {record.count} 条，{seconds}")
+                for item in record.results[:1]:
+                    print(f"         {item.title[:50] or '(无标题)'}  {item.url}")
+            elif not record.sent:
+                print(f"[跳过] {record.label}: 没有发出请求（{record.error}）")
+            else:
+                failed += 1
+                print(f"[失败] {record.label}: {record.error}（{seconds}）")
+        print()
+    statuses = pool_status()
+    if statuses:
+        print("== key 状态 ==")
+        for name, line in statuses.items():
+            print(f"{name}: {line}")
+    return 1 if failed else 0
+
+
+def cmd_check(query: str) -> int:
+    return asyncio.run(_check(query))
+
+
+# 自测子进程只继承这些与运行环境有关的变量；其余一律不带，
+# 这样你机器上配的 key、代理和各种开关都影响不到自测结果。
+_PASSTHROUGH_ENV = (
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
+    "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "LANG", "LC_ALL", "PYTHONPATH", "VIRTUAL_ENV",
+)
+
+
+def cmd_selftest(child: bool) -> int:
+    if child:
+        from .selftest import run
+
+        return run()
+    from .selftest import SANDBOX_ENV
+
+    with tempfile.TemporaryDirectory(prefix="aggregate-search-selftest-") as sandbox:
+        env = {name: os.environ[name] for name in _PASSTHROUGH_ENV if name in os.environ}
+        env.update(SANDBOX_ENV)
+        env["AGGREGATE_SEARCH_HOME"] = sandbox
+        env["PYTHONIOENCODING"] = "utf-8"
+        # 从源码目录用 `python 路径/server.py selftest` 运行时，包没有装进 site-packages，
+        # 得把包所在的目录告诉子进程，否则它找不到 aggregate_search。
+        package_parent = str(Path(__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (package_parent, env.get("PYTHONPATH", "")) if part
+        )
+        print("离线自测：在临时沙盒里运行，不联网，不读取也不改动你的配置。\n")
+        sys.stdout.flush()
+        done = subprocess.run(
+            [sys.executable, "-m", "aggregate_search", "selftest", "--child"], env=env
+        )
+    return done.returncode
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="aggregate-search",
+        description="聚合联网搜索 MCP。不带任何参数运行即启动 MCP 服务（stdio），供 MCP 客户端调用。",
+    )
+    parser.add_argument("--version", action="version", version=f"aggregate-search {__version__}")
+    sub = parser.add_subparsers(dest="command", metavar="命令")
+
+    sub.add_parser("serve", help="启动 MCP 服务（不带参数时的默认行为）")
+
+    p = sub.add_parser("init", help="生成全局配置目录和 .env 模板（已有配置不会被覆盖）")
+    p.add_argument("--from", dest="source", metavar=".env路径", help="从已有的 .env 文件导入")
+
+    sub.add_parser("path", help="显示配置目录位置")
+
+    p = sub.add_parser("status", help="查看各家 key、冷却、用量和抓取顺序")
+    p.add_argument("--usage", dest="days", type=int, default=0, metavar="天数", help="附带近 N 天使用记录")
+
+    p = sub.add_parser("search", help="直接搜索一次")
+    p.add_argument("query", nargs="+", help="搜索关键词")
+    p.add_argument("--mode", choices=("auto", "free", "escalate", "all"), help="搜索模式，默认 auto")
+    p.add_argument("--region", help="补搜偏好: domestic / global / mixed")
+    p.add_argument("--providers", help="只查指定厂商，逗号分隔，如 tavily,exa")
+    p.add_argument("--max", type=int, help="每家取几条")
+    p.add_argument("--total", type=int, help="最终返回多少个页面")
+
+    p = sub.add_parser("fetch", help="抓取网页正文")
+    p.add_argument("url")
+    p.add_argument("backend", nargs="?", default="", help="可选，指定抓取后端")
+
+    p = sub.add_parser("check", help="让每家各发一次真实请求，检查连通性")
+    p.add_argument("query", nargs="*", help="测试用的关键词")
+
+    p = sub.add_parser("usage", help="查看本地使用记录汇总")
+    p.add_argument("days", nargs="?", type=int, default=7, help="统计最近几天，默认 7")
+
+    p = sub.add_parser("selftest", help="离线自测（不联网、不动你的配置）")
+    p.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    _prepare_streams()
+    if not argv or argv[0] == "serve":
+        # MCP 客户端走这里。stdout 是协议通道，这条路径上不能往 stdout 打印任何东西。
+        from .server import main as serve
+
+        serve()
+        return
+
+    args = build_parser().parse_args(argv)
+    command = args.command
+    if command == "init":
+        code = cmd_init(args.source)
+    elif command == "path":
+        code = cmd_path()
+    elif command == "status":
+        code = cmd_status(args.days)
+    elif command == "usage":
+        code = cmd_usage(args.days)
+    elif command == "search":
+        code = cmd_search(args)
+    elif command == "fetch":
+        code = cmd_fetch(args.url, args.backend)
+    elif command == "check":
+        code = cmd_check(" ".join(args.query) or "Python 3.13 新特性")
+    elif command == "selftest":
+        code = cmd_selftest(args.child)
+    else:
+        build_parser().print_help()
+        code = 0
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()
