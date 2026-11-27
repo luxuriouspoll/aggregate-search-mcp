@@ -603,7 +603,8 @@ def check_provider_names(settings: RuntimeSettings | None = None, json_keys=None
         ("PROXY_PROVIDERS", sorted(settings.PROXY_PROVIDERS)),
         ("SEARCH_PROVIDERS", settings.SEARCH_PROVIDERS_LIMIT or []),
     ):
-        check_list(label, names)
+        extra = frozenset({"github"}) if label == "PROXY_PROVIDERS" else frozenset()
+        check_list(label, names, extra)
     for label, limits in (("DAILY_LIMITS", settings.DAILY_LIMITS), ("MONTHLY_LIMITS", settings.MONTHLY_LIMITS)):
         check_list(label, list(limits))
     # 抓取后端只允许真正支持抓取的那几家

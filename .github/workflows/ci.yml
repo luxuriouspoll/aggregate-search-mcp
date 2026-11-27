@@ -45,7 +45,7 @@ jobs:
         run: python -m aggregate_search selftest
 
       - name: 离线评测快照重放
-        run: python scripts/eval_search.py --output eval-run.tmp --compare evals/baseline-0.5.2.json
+        run: python scripts/eval_search.py --output eval-run.tmp --compare evals/baseline-0.5.3-expanded.json
 
   package:
     name: 构建并校验发行包

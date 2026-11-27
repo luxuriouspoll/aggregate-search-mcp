@@ -21,10 +21,10 @@
 | **零 Key 开箱即用** | 内置 Parallel、Keenable、AnySearch 匿名通道，不申请任何 API Key 也能立刻联网搜索与抓正文 |
 | **按需补搜省额度** | 简单问题不烧账号额度；覆盖不足才按「国内 / 国际 / 混合」软路由补查 3 家不同厂商 |
 | **多 Key 轮换与硬限额** | 同厂商多 Key 自动轮询与故障冷却；SQLite WAL 多进程原子计费，支持单 Key 日/月上限与服务端禁 Key 硬锁 |
-| **高信噪比与安全隔离** | 同网址跨源合并、近似转载折叠、官方一手来源加权、严格发布时间核验；外部内容包裹 `<untrusted_content>` 防提示词注入 |
+| **高信噪比与原文阅读** | 同网址跨源合并、近似转载折叠、官方来源加权、共享摘录预算；长文支持 `start_index` 分段续读与 `focus` 聚焦定位；外部内容包裹 `<untrusted_content>` 防提示词注入 |
 | **轻量易部署** | 仅依赖 `mcp` 与 `httpx`（Python 3.10+）；一次全局安装到处可用，同时支持本机 `stdio` 与远程 [Streamable HTTP](#可选-http-传输) |
 
-> **已在用 0.5.0 或 0.5.1？** 不用删旧 MCP，也不用重填 Key。按 [使用指南 · 就地升级](docs/usage-guide.md#1-已有-050不删旧-mcp就地升级) 更新程序，验收后重连原来的注册项。
+> **已在用 `0.5.0` ~ `0.5.3`？** 不用删旧 MCP，也不用重填 Key。按 [使用指南 · 就地升级](docs/usage-guide.md#1-已有-050不删旧-mcp就地升级) 更新程序，验收后重连原来的注册项。
 >
 > **第一次使用？** 推荐直接看 [手把手使用指南](docs/usage-guide.md)，几分钟内完成安装和第一次匿名实搜。各家免费额度以厂商控制台实时说明为准。
 
@@ -52,6 +52,7 @@
 - [故障排查](#故障排查)
 - [从旧版升级](#从旧版升级)
 - [项目结构与开发](#项目结构与开发)
+- [离线评测（evals）](evals/README.md)
 - [安全说明](#安全说明)
 - [变更记录](#变更记录)
 - [许可](#许可)
@@ -65,7 +66,7 @@
 这个 MCP 的处理方式是：
 
 1. **匿名优先**。先查免费的 Parallel、Keenable、AnySearch；某家匿名通道限流时，`auto` 可按配置切换到同厂商的账号通道。
-2. **判断够不够**。先按站点、发布日期过滤（如有指定），再折叠近似重复；用留下的结果判断相关页面数、证据条数、多家共识或官方一手来源。
+2. **判断够不够**。先按站点、发布日期过滤（如有指定），再折叠近似重复；用留下的结果判断相关独立页面数、证据条数、多渠道命中同页或官方一手来源。
 3. **不够再补查**。按「国内 / 国际 / 混合」调整顺序，默认补 3 家**不同**厂商，而不是把一家的 3 个 key 全打一遍。
 4. **合并证据**。同一网址的多份摘要、日期、来源都保留，标明每条信息的出处。
 5. **核验信息**。本地检查只决定要不要补搜，不证明内容正确；AI 还要读证据，核验来源。
@@ -85,14 +86,14 @@
 推荐从固定发布标签安装（也可从 [Releases](https://github.com/luxuriouspoll/aggregate-search-mcp/releases) 下载 `.whl` 安装）：
 
 ```bash
-uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.3'
+uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.4'
 uv tool update-shell                # 首次用 uv 装全局工具必跑：把 ~/.local/bin 写入系统 PATH
 ```
 
 > **Windows / 新装 `uv` 防坑提示**：首次用 `uv tool install` 安装工具时，末尾常提示 `` `C:\Users\...\.local\bin` is not on your PATH ``，此时直接在当前窗口运行 `aggregate-search` 会报“无法将‘aggregate-search’项识别为 cmdlet…”。执行一次上面的 `uv tool update-shell`，然后**关掉并重新打开终端窗口**（已打开的旧窗口和桌面客户端不会自动刷新 `PATH`），再验证版本：
 
 ```bash
-aggregate-search --version          # 显示 aggregate-search 0.5.3
+aggregate-search --version          # 显示 aggregate-search 0.5.4
 ```
 
 想跟随开发主分支可用 `@master`；也可克隆仓库后在根目录用 `uv tool install .` 或 `pipx install .`（虚拟环境内用 `python -m pip install .`）。
@@ -130,7 +131,7 @@ aggregate-search search "MCP 是什么"      # 真的搜一次
 
 ```bash
 # 升级到最新固定发布版（推荐，不需要先克隆）
-uv tool install --force --reinstall 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.3'
+uv tool install --force --reinstall 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.4'
 
 # 或在已更新的本地源码仓库根目录执行
 uv tool install --force --reinstall .
@@ -351,7 +352,7 @@ Parallel、Keenable、AnySearch 不配 key 就能搜。即使配了，`auto` 的
 {"query": "Go 泛型", "time_range": "month", "domains": ["go.dev"]}
 ```
 
-返回内容：查了几家 / 几家有结果 / 失败几家、本地判断结论、**实际成本**、下一步建议、多源共识、去重后的证据列表（每条带来源）、每家的耗时和状态。
+返回内容：检索渠道数与转载折叠后的独立原始页面数、查了几家 / 几家有结果 / 失败几家、本地判断结论、**实际成本**、下一步建议、多渠道命中同页、去重后的证据列表（含共享预算摘录、来源与 SearXNG 底层引擎溯源）、每家的耗时和状态。
 
 一次搜索有**总时限**（默认 45 秒）：到点还没返回的厂商直接放弃，带着已经拿到的结果返回，不会拖到客户端超时把结果全丢掉。
 
@@ -363,14 +364,28 @@ Parallel、Keenable、AnySearch 不配 key 就能搜。即使配了，`auto` 的
 
 发布日期支持 ISO 日期、中文年月日（如 `2026年11月25日`），以及带明确时区的 ISO 或 RFC 时间戳。不会把无时区时间戳、相对时间、网页更新时间或爬取时间换算成发布日期。Perplexity 是按厂商契约处理的例子：[Sonar 的 OpenAPI](https://docs.perplexity.ai/openapi.json) 明确区分 `search_results[].date`（发布日期）与 `last_updated`（更新时间）；其他厂商仅名为 `date` 的字段不能据此类推。
 
-### `web_fetch` — 抓网页正文
+### `web_fetch` — 抓网页正文、聚焦定位与分段续读
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `url` | 是 | 要抓取的 `http` / `https` 网页地址（调用前校验格式、主机名与端口合法性） |
+| `provider` | 否 | 显式指定单一抓取后端；不传按免费优先顺序尝试 |
+| `start_index` | 否 | 非负字符位置，默认 `0`；用于接着上一次末尾顺序续读缓存原文 |
+| `focus` | 否 | 可选关键词或版本号/数字（如 `"配置代理"`、`"0.5.3"`、`"429"`）；按相关性提取段落并输出原文区间位置 |
 
 ```json
 {"url": "https://example.com"}
 {"url": "https://example.com", "provider": "jina"}
+{"url": "https://example.com/long-doc", "focus": "配置代理"}
+{"url": "https://example.com/long-doc", "start_index": 20000}
 ```
 
-不指定后端时**免费优先**：
+阅读与抓取策略：
+
+- **分段续读与缓存边界**：单页展示上限 `FETCH_MAX_CHARS=20000`，单文档缓存及上游抓取上限 `FETCH_CACHE_MAX_CHARS=100000`（两项均支持热加载）。位置按缓存中已脱敏文本的 Python 字符计数（中英文一致），输出给出半开区间 `[start, end)` 和下一页 `start_index`。缓存最多保留 64 篇 / 总正文 400 万字符，默认有效期 `300` 秒；**只有命中仍在有效期内且满足当前账号策略的缓存时，翻页才不发额外 HTTP 请求**（过期、淘汰或配置变化后重新抓取，原文位置可能变化）。
+- **聚焦定位（`focus`）**：支持中文词汇、英文词与纯数字/版本号（如 `0.5.3`、`429`）。定位时保留 `start_index` 之前的 Markdown 章节标题上下文，超长段落按 80 字符重叠切分并去重合并，围绕命中关键词保留上下文，且跨边界按全文完整数字校验（不会把 `1429` 拆成 `429`）。未命中时退回从 `start_index` 起顺序输出。
+- **GitHub 仓库首页直取**：抓取标准 HTTPS 仓库首页（如 `https://github.com/owner/repo` 或 `.git` 结尾）且未指定 `provider` 时，优先从 `raw.githubusercontent.com` 的 `HEAD` 分支匿名直取 README（依次尝试 `README.md`、`readme.md`、`README.rst`、`README`、`README.MD`），不调用 GitHub REST API、拒绝重定向、下载上限 `2 MB`（其余后端解码响应上限 `8 MB`），保留原始 `github.com` 引用。Issue、PR、Release、具体文件与目录链接仍按原目标抓取。
+- **匿名优先回退链**：
 
 1. `WEB_FETCH_PROVIDER` 指定的后端（如果你设置了）
 2. Parallel、Keenable（匿名，不花额度）
@@ -383,9 +398,7 @@ Parallel、Keenable、AnySearch 不配 key 就能搜。即使配了，`auto` 的
 - 免费后端都抓不到时，最多再试 2 个带 key 的后端——连它们都抓不到，多半是地址本身有问题，不再继续消耗额度
 - 抓取工具报的错（"403 Forbidden""需要登录"之类）多半是目标网页的问题，不会因此把你的 key 判成失效
 
-`web_fetch` 不接受 `search_mode`。默认模式为 `free` 或开启 `SEARCH_NO_ACCOUNT_KEYS=true` 时，只允许匿名后端；显式指定后端也不能用于发送账号 key。抓取命中缓存时不会发出请求；如果启用了使用记录，会记一次缓存命中，出站请求与额度消耗都记为零。
-
-只支持 http / https。
+`web_fetch` 不接受 `search_mode`。默认模式为 `free` 或开启 `SEARCH_NO_ACCOUNT_KEYS=true` 时，只允许匿名后端；显式指定后端也不能用于发送账号 key。抓取命中缓存时不会发出请求；如果启用了使用记录，会记一次缓存命中，出站请求与额度消耗都记为零。只支持 `http` / `https`。
 
 ### `web_status` — 看状态
 
@@ -394,7 +407,7 @@ Parallel、Keenable、AnySearch 不配 key 就能搜。即使配了，`auto` 的
 {"usage_days": 7}
 ```
 
-显示：配置文件在哪、配置里有没有写错的行、每家是否启用、key 可用数、冷却和今日用量、抓取顺序、当前能用于补搜的厂商、走的是哪条网络。传 `usage_days` 还会附上近几天的使用统计。
+显示：配置文件在哪、配置里有没有写错的行、每家是否启用、key 可用数、冷却和今日用量、抓取顺序、当前能用于补搜的厂商、走的是哪条网络，以及当前单页展示 / 单文档缓存 / 共享摘录字符预算。传 `usage_days` 还会附上近几天的使用统计。
 
 ---
 
@@ -449,15 +462,16 @@ aggregate-search usage 7     # 近 7 天：各家调用次数、成功率、平�
 | `aggregate-search status` | 显示这个新进程读取的配置、Key、用量和抓取顺序；确认常驻服务当前限额请用 `web_status` |
 | `aggregate-search reset-cooldown <厂商> [--apply]` | 默认只预览；加 `--apply` 才清除该厂商有效的账号 Key 冷却，包括已移出配置的旧指纹。不会清除日/月用量或匿名限流 |
 | `aggregate-search search 关键词` | 搜一次。可加 `--mode`、`--region`、`--providers`、`--max`、`--total`、`--time-range`、`--domains` |
-| `aggregate-search fetch URL [后端]` | 抓一个网页 |
+| `aggregate-search fetch URL [后端] [--start-index N] [--focus 关键词]` | 抓网页正文，支持按字符位置续读与关键词聚焦（`--start-index` 为负数时退出码为 `2`） |
 | `aggregate-search check [关键词]` | 发送真实请求逐家诊断；带 key 的请求会计入用量，开启 `SEARCH_NO_ACCOUNT_KEYS=true` 后只测匿名通道 |
 | `aggregate-search usage [天数]` | 使用记录汇总，默认 7 天 |
 | `aggregate-search selftest` | 离线自测，不联网，不读也不改你的配置 |
 
-例如，搜索最近 30 天的指定站点（`--domains` 用逗号隔开）：
+例如，搜索最近 30 天的指定站点（`--domains` 用逗号隔开），或聚焦抓取某个仓库：
 
 ```bash
 aggregate-search search "Python 版本更新" --time-range month --domains docs.python.org,python.org
+aggregate-search fetch "https://github.com/modelcontextprotocol/modelcontextprotocol" --focus "stdio"
 ```
 
 ---
@@ -532,7 +546,7 @@ Perplexity 默认**不参与自动补搜**（它每次搜索是一次大模型�
 | `MONTHLY_LIMITS` | 空 | 每个 key 每月最多请求数 |
 | `AUTO_MIN_RESULTS` | `4` | 判断门槛：最少证据条数 |
 | `AUTO_MIN_UNIQUE` | `3` | 判断门槛：最少相关独立页面数 |
-| `AUTO_MIN_CONSENSUS` | `1` | 判断门槛：复杂问题最少三源共识页面数（有官方来源也算通过）；`0` = 不要求 |
+| `AUTO_MIN_CONSENSUS` | `1` | 判断门槛：复杂问题最少三渠道命中同页数（有官方来源也算通过）；`0` = 不要求 |
 
 ### 国内 / 国际
 
@@ -550,8 +564,8 @@ Perplexity 默认**不参与自动补搜**（它每次搜索是一次大模型�
 | `FETCH_MIN_CHARS` | `200` | 正文短于这个长度就换一家复核（只复核一次）；`0` 关闭 |
 | `FETCH_KEYED_FALLBACKS` | `2` | 免费后端都失败后，最多再试几个带 key 的后端 |
 | `FETCH_CACHE_TTL` | `300` | 抓取缓存有效期（秒）；`0` = 不缓存 |
-| `FETCH_MAX_CHARS` | `20000` | 单次原文展示上限 |
-| `FETCH_CACHE_MAX_CHARS` | `100000` | 单文档缓存与上游抓取上限，热加载 |
+| `FETCH_MAX_CHARS` | `20000` | 单次原文展示上限（热加载） |
+| `FETCH_CACHE_MAX_CHARS` | `100000` | 单文档缓存与上游抓取上限（支持该参数的上游同步截断），热加载 |
 | `SEARCH_EXCERPT_MAX_CHARS` | `6000` | 所有页面共享的摘录字符预算，热加载 |
 
 ### 网络
@@ -559,7 +573,7 @@ Perplexity 默认**不参与自动补搜**（它每次搜索是一次大模型�
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `SEARCH_PROXY` | 空 | 代理地址，如 `http://127.0.0.1:7897` |
-| `PROXY_PROVIDERS` | `jina,duckduckgo,youcom` | 哪几家走上面这个代理 |
+| `PROXY_PROVIDERS` | `jina,duckduckgo,youcom` | 哪几家走上面这个代理（直连 GitHub README 不稳时也可追加 `github`） |
 | `SEARCH_PROXY_ALL` | `false` | `true` = 所有厂商都走上面这个代理 |
 | `USE_SYSTEM_PROXY` | `true` | 其余厂商跟随系统代理设置；`false` = 强制直连 |
 | `SEARCH_TIMEOUT` | `15` | 单家超时秒数 |
@@ -608,11 +622,10 @@ Perplexity 默认**不参与自动补搜**（它每次搜索是一次大模型�
 1. **网址统一**：域名小写、去掉 `www`、默认端口、跟踪参数（`utm_*`、`fbclid` 等）、结尾斜杠；查询参数排序
 2. **保留有意义的差异**：`share_token` 之类有功能的参数和 hash 路由（`#/path`）保留，避免把不同页面错并成一条
 3. **多份证据都留存**：同一网址的标题、摘要、日期全部保留，并标明每条来自哪家
-4. **排序**：等效来源数优先。官方一手来源（gov.cn、官方文档等）按 1.2 个来源加权——
-   压过两家低质转载，但压不过三家独立共识；结果里会标注"官方一手来源"。其次看各家原始名次
-5. **保守折叠**：只有标题和摘要都高度相似的转载才折叠；**版本号、日期、金额等数字不一致时不折叠**（`Python 3.13` 和 `Python 3.14` 的文章不会被合并）
-6. **折叠后重排**：保留转载链接，重新计算来源数和排名
-7. **展示预算**：每个页面最多展示 3 条不同证据，单条摘要最多 500 字；有省略会写明数量
+4. **排序**：等效来源数优先。官方一手来源（gov.cn、官方文档等）额外加 **1.2**（单渠道官网等效 `1 + 1.2 = 2.2`，压过两家低质转载，但压不过三渠道独立命中）；结果里会标注"官方一手来源"。其次看各家原始名次
+5. **保守折叠**：只有标题和摘要都高度相似的转载才折叠；**版本号、日期、金额、端口等数字及词项顺序不一致时不折叠**（`Python 3.13` 和 `Python 3.14`、或互换端口的文章不会被误合并）
+6. **渠道区分与重排**：保留转载链接并重新计算等效来源数与排名，分别统计"检索渠道数"与"独立原始页面数"；SearXNG 会在摘要处标注底层引擎名称供溯源，但计费与 `auto` 判断仍算作一个上游渠道
+7. **共享摘录预算**：单次搜索的全部摘要共享 `SEARCH_EXCERPT_MAX_CHARS`（默认 6000 字符），按「先为每个独立页面分配保底主摘要 → 如有富余按排名优先回填被截断的主摘要 → 再按信息增量分配差异补充摘要」的顺序裁剪（日期前缀计入预算，标题、来源与审计信息另计）；预算用尽会注明用 `web_fetch` 阅读原文
 8. **不隐瞒**：因 `total_results` 没展示的页面会在统计里注明，不会让你以为没搜到
 
 ---
@@ -639,6 +652,7 @@ aggregate-search check
 | Parallel 匿名报 rate limit | 匿名通道有频率限制，应等冷却到期再试。若未开启硬锁，`auto` 在允许 `ANON_KEY_FALLBACK` 且配有可用 key 时可回退到账号通道 |
 | 结果里出现「等待超过总时限」 | 慢的厂商被放弃，其余结果照常返回。频繁超时时可调大 `TOTAL_TIMEOUT`（别超过客户端的工具超时） |
 | Jina / You.com / DuckDuckGo 超时 | 国内直连不稳，设置 `SEARCH_PROXY`（默认只有这三家走它） |
+| GitHub 仓库首页直取超时 | 若关闭了系统代理（`USE_SYSTEM_PROXY=false`），`raw.githubusercontent.com` 默认不走 `SEARCH_PROXY`；在 `PROXY_PROVIDERS` 追加 `github` 即可走代理 |
 | 国内厂商变慢或报网络错误 | 系统代理开着全局模式，把国内厂商也绕出去了。切回规则模式，或设 `USE_SYSTEM_PROXY=false` |
 | 百度 / 元宝 / 智谱 / 博查没结果 | 确认已开通搜索服务且有额度；后三家未实测 |
 | SearXNG 返回的不是 JSON | 在实例 `settings.yml` 里给 `search.formats` 加上 `json` |
@@ -704,16 +718,20 @@ aggregate_search/
   keypool.py        多 key 轮转、并发分配、冷却逻辑
   store.py          state.db：冷却与用量计数、旧状态迁移
   usage.py          本地使用记录与用量上限
-  quality.py        本地判断：覆盖度、共识、官方来源
+  quality.py        本地判断：覆盖度、多渠道命中同页、官方来源
   routing.py        国内 / 国际 / 混合识别与补搜排序
+  reading.py        长文分段/聚焦阅读与 GitHub 仓库 README 直取
+  excerpts.py       共享摘录预算三段式分配与差异片段合并
   selftest.py       离线自测
   providers/
     __init__.py     厂商注册表、调度、匿名 / 带 key 的调用记录
     base.py         HTTP 封装、脱敏、URL 归一化、证据合并
     *.py            19 个厂商适配器
   templates/        .env 与 keys.json 模板
+README_EN.md        英文说明（安装、客户端接入、配置速查与离线评测概述）
 docs/usage-guide.md 安装、升级与首次实搜手把手指南
-scripts/            发行包（sdist / wheel）完整性与隐私检查脚本
+evals/              34 题离线快照评测集、基线与结果报告
+scripts/            发行包（sdist / wheel）校验与离线评测脚本
 server.py           旧启动方式的兼容入口
 mcp_handshake_demo.py   手动演示一次完整的 MCP 对话
 ```
@@ -732,7 +750,7 @@ python -m venv .venv
 
 `selftest` 在临时沙盒里跑，用的是假 key：不联网，也不读不改你的真实配置。它测两层东西：
 
-- **调度**：把各家的网络调用换成假后端，验证搜索模式、补搜、多 key 轮换、成本记账、抓取回退等逻辑
+- **调度**：把各家的网络调用换成假后端，验证搜索模式、补搜、多 key 轮换、成本记账、抓取回退、预算回填与聚焦定位等逻辑
 - **适配器本身**：用不联网的假响应喂给 19 家真实的适配器代码，覆盖正常响应、各家的业务报错，以及几十种"不对劲"的响应（不是 JSON、字段缺失、字段类型不对……）。适配器遇到它们只允许正常返回或报"调用失败"，不允许冒出程序错误
 
 改了代码先跑它。新增或修改适配器后尤其要跑——假后端测不到适配器自己的解析代码。
@@ -771,27 +789,10 @@ python -m venv .venv
 
 每个版本改了什么，见 [CHANGELOG.md](CHANGELOG.md)。
 
-`0.5.2` 修复 Perplexity 网页证据丢失和中文关键词漏配，扩大可靠发布日期的格式支持，增加可预览的本地账号冷却维护命令。`0.5.1` 将默认免费模式与服务端硬锁分开，修正了热加载、筛选、会话隔离及多进程限额。
+`0.5.4` 改进共享摘录预算回填与去重顺序保持，完善 `focus` 数字定位、前置标题与跨块重叠处理，兼容 GitHub `.git` 地址直取、`PROXY_PROVIDERS=github` 校验与 CLI `fetch` 参数，并扩充 34 题离线快照评测。`0.5.3` 加入 `start_index` 分段续读、`focus` 段落筛选、GitHub README 直取、共享摘录预算、SearXNG 溯源与英文文档。`0.5.2` 修复 Perplexity 网页证据丢失和中文关键词漏配，扩大可靠发布日期格式支持并新增冷却维护命令。`0.5.1` 将默认免费模式与服务端硬锁分开，修正热加载、筛选、会话隔离及多进程限额。
 
 ## 许可
 
 [MIT](LICENSE) © 2026 luxuriouspoll
 
 可以自由使用、修改、分发，包括商用；保留版权声明即可。软件按"现状"提供，不附带任何担保。
-
-
-## 0.5.3 原文阅读与证据摘录
-
-三个 MCP 工具继续为 `web_search`、`web_fetch`、`web_status`。
-
-`web_fetch(url, provider=None, start_index=0, focus="")` 支持按字符位置续读。默认返回正文前 20000 字符，输出给出半开区间和下一页起点。将返回的起点传入 `start_index` 即可顺序阅读。位置按缓存中已脱敏文本的 Python 字符计数，适用于中文。超出末尾会明确提示。
-
-显式传入 `focus="配置代理"` 时，用标准库词频相关性筛选段落并标出原文位置。省略 focus 时按原文顺序输出。选择位置可再用 start_index 阅读上下文。
-
-`FETCH_CACHE_MAX_CHARS=100000` 控制每份缓存正文与支持该参数的上游抓取长度，`FETCH_MAX_CHARS=20000` 控制每次展示长度。达到缓存上限时提示可能还有内容。上游服务也可能仅提供部分正文，已获取长度代表本次可读文本。缓存最多 64 条、总正文 400 万字符，TTL 默认 300 秒。只有命中仍有效且满足当前账号策略的缓存时，续读才零额外请求；过期、淘汰或配置变化会重新抓取，网页更新后位置可能变化。
-
-标准 HTTPS GitHub 仓库首页优先从 raw.githubusercontent.com 的 HEAD 分支直取 README，兼容 README.md、readme.md、README.rst、README 和 README.MD。原始 github.com 引用保留。指定 provider 时尊重该后端；Issue、PR、Release、blob 和 tree 页面按原目标抓取。直取不调用 GitHub REST API，拒绝跳转，限制 2 MB 下载；其他后端解码响应上限为 8 MB。
-
-`SEARCH_EXCERPT_MAX_CHARS=6000` 是单次搜索共享摘录预算。先给独立页面分配主摘要，再补充有差异的摘要，保留版本、日期与全部命中渠道。预算只限制摘录文本，标题、来源和审计信息另计。检索渠道数与转载折叠后的原始页面数分别展示，跨渠道命中同页继续沿用原有 auto 判断标准。SearXNG 可展示底层引擎名称，调度和计费仍算单个上游。
-
-上述三个长度配置均支持热加载。离线评测见仓库 evals/README.md。

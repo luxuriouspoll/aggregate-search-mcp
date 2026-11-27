@@ -4,10 +4,9 @@ from difflib import SequenceMatcher
 from .providers.base import numeric_terms
 
 
-def _words(text: str) -> set[str]:
-    english = re.findall(r"[a-z0-9_]+", text.casefold())
-    chinese = re.findall(r"[\u4e00-\u9fff]+", text)
-    return set(english) | {span[i:i+2] for span in chinese for i in range(max(1, len(span)-1))}
+def _words(text: str) -> tuple[str, ...]:
+    # Preserve order and repetitions: swapping values between entities changes facts.
+    return tuple(re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", text.casefold()))
 
 
 def _clip(text: str, allowance: int) -> str:
@@ -65,6 +64,14 @@ def excerpt_plan(items: list[dict], budget: int) -> list[list[dict]]:
         output[index].append(entry)
         remaining -= len(entry['snippet'])
     supplements = []
+    # Spend unused primary reservations on higher-ranked pages before supplements.
+    for index, entries in enumerate(candidates):
+        if not entries or not output[index] or remaining <= 0:
+            continue
+        primary = output[index][0]
+        previous_length = len(primary['snippet'])
+        primary['snippet'] = _clip(entries[0]['snippet'], previous_length + remaining)
+        remaining -= len(primary['snippet']) - previous_length
     for index, entries in enumerate(candidates):
         for entry in entries[1:]:
             novelty = len(numeric_terms(entry['snippet'])) + bool(entry.get('published')) + bool(re.search(r'[“"「]', entry['snippet']))

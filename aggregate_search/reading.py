@@ -1,4 +1,5 @@
 """Bounded document presentation and GitHub repository README retrieval."""
+from bisect import bisect_right
 import math
 import re
 from urllib.parse import urlsplit
@@ -6,8 +7,25 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import config
-from .providers.base import FetchResult, redact
+from .providers.base import FetchResult, _DIGIT_PUNCTUATION, _NUMERIC_TOKEN, numeric_terms, redact
 from .quality import _query_terms
+
+
+def _uncovered(left: int, right: int, used: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Subtract already displayed intervals without duplicating overlap characters."""
+    pieces = []
+    cursor = left
+    for used_left, used_right in sorted(used):
+        if used_right <= cursor:
+            continue
+        if used_left >= right:
+            break
+        if used_left > cursor:
+            pieces.append((cursor, used_left))
+        cursor = max(cursor, used_right)
+    if cursor < right:
+        pieces.append((cursor, right))
+    return pieces
 
 
 def document_page(content: str, start: int, focus: str, limit: int) -> str:
@@ -19,37 +37,73 @@ def document_page(content: str, start: int, focus: str, limit: int) -> str:
         end = min(total, start + limit)
         hint = f"\n继续阅读请传 start_index={end}" if end < total else "\n已到缓存正文末尾。"
         return f"原文区间 [{start}, {end}) / 已获取正文 {total} 字符\n\n{content[start:end]}{hint}"
-    # Include headings with their following paragraphs. Bound huge paragraphs.
-    boundaries = [0] + [m.end() for m in re.finditer(r"\n\s*\n", content)] + [total]
+    # Scan headings across the entire document, including text before start.
+    headings = list(re.finditer(r"(?m)^ {0,3}#{1,6}[ \t]+[^\r\n]*", content))
+    heading_offsets = [match.start() for match in headings]
+    boundaries = sorted({0, total, *heading_offsets,
+                         *(m.end() for m in re.finditer(r"\n\s*\n", content))})
+    numbers = numeric_terms(focus)
+    terms = list(dict.fromkeys([*sorted(numbers), *_query_terms(focus.casefold())]))[:64]
+    # Match numeric tokens against the whole document so window boundaries cannot
+    # turn 1429 into a false match for 429. Translation preserves character offsets.
+    hits = {term: [] for term in terms}
+    for match in _NUMERIC_TOKEN.finditer(content.translate(_DIGIT_PUNCTUATION)):
+        token = match.group().replace(',', '').casefold()
+        if token in hits:
+            hits[token].append(match.span())
+    for term in terms:
+        if term not in numbers:
+            hits[term] = [match.span() for match in re.finditer(re.escape(term), content, re.I)]
     blocks = []
+    frequencies = []
     for left, right in zip(boundaries, boundaries[1:]):
-        for offset in range(max(left, start), right, 2000):
-            blocks.append((offset, min(offset + 2000, right)))
-    terms = _query_terms(focus.casefold())[:64]
-    texts = []
-    heading = ""
-    for left, right in blocks:
-        text = content[left:right]
-        if text.lstrip().startswith("#"):
-            heading = text.splitlines()[0]
-        texts.append((heading + "\n" + text).casefold())
-    weights = {term: math.log(1 + len(texts)/(1 + sum(term in text for text in texts))) for term in terms}
+        for offset in range(max(left, start), right, 1920):
+            end = min(offset + 2000, right)
+            heading_index = bisect_right(heading_offsets, offset) - 1
+            heading = headings[heading_index].group() if heading_index >= 0 else ""
+            text = (heading + "\n" + content[offset:end]).casefold()
+            heading_numbers = numeric_terms(heading)
+            counts = {}
+            for term in terms:
+                body_count = sum(offset <= a and b <= end for a, b in hits[term])
+                heading_count = int(term in heading_numbers) if term in numbers else heading.casefold().count(term)
+                counts[term] = body_count + heading_count
+            frequencies.append(counts)
+            blocks.append((offset, end, len(text)))
+            if end == right:
+                break
+    weights = {term: math.log(1 + len(blocks)/(1 + sum(row[term] > 0 for row in frequencies)))
+               for term in terms}
     scored = []
-    for (left, right), text in zip(blocks, texts):
-        score = sum(weights[t] * text.count(t)/(1 + text.count(t) + len(text)/1000) for t in terms)
+    for (left, right, length), counts in zip(blocks, frequencies):
+        score = sum(weights[term] * count/(1 + count + length/1000) for term, count in counts.items())
         if score:
             scored.append((score, left, right))
     if not scored:
         return "未匹配 focus，按原文顺序展示。\n" + document_page(content, start, "", limit)
     selected = []
+    used = []
     remaining = limit
     for _, left, right in sorted(scored, key=lambda row: (-row[0], row[1])):
         if remaining <= 0:
             break
-        end = min(right, left + remaining)
-        selected.append(f"原文区间 [{left}, {end})\n{content[left:end]}")
-        remaining -= end - left
-    return f"聚焦摘录 / 已获取正文 {total} 字符；可用 start_index 查看原文上下文。\n\n" + "\n\n".join(selected)
+        for left, right in _uncovered(left, right, used):
+            if right - left > remaining:
+                anchors = sorted((a, b) for spans in hits.values() for a, b in spans
+                                 if left <= a and b <= right and b - a <= remaining)
+                if anchors:
+                    anchor_start, anchor_end = anchors[0]
+                    context = min(80, max(0, (remaining - (anchor_end - anchor_start)) // 2))
+                    left = max(left, anchor_start - context)
+            end = min(right, left + remaining)
+            if end <= left:
+                break
+            selected.append(f"原文区间 [{left}, {end})\n{content[left:end]}")
+            used.append((left, end))
+            remaining -= end - left
+    return (f"聚焦摘录 / 已获取正文 {total} 字符；命中 {len(scored)} 个候选片段，"
+            f"展示 {len(selected)} 个去重区间；可用 start_index 查看原文上下文。\n\n"
+            + "\n\n".join(selected))
 
 
 def github_repository(url: str) -> tuple[str, str] | None:
@@ -59,8 +113,10 @@ def github_repository(url: str) -> tuple[str, str] | None:
                 or parts.username or parts.password or parts.query or parts.fragment):
             return None
         match = re.fullmatch(r'/([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)/?', parts.path)
-        if match and match[2] not in ('.', '..'):
-            return match[1], match[2]
+        if match:
+            repository = match[2].removesuffix('.git')
+            if repository and repository not in ('.', '..'):
+                return match[1], repository
     except ValueError:
         pass
     return None

@@ -3581,6 +3581,139 @@ async def t_reading_limits():
         raise AssertionError("oversized body accepted")
 
 
+@case("0.5.4：12 页预算回填、日期前缀与边界")
+def t_primary_refill():
+    import copy
+    from .excerpts import excerpt_plan
+    items = [{"evidence": [{"source": "parallel", "url": f"https://example.com/{i}",
+                            "snippet": "A" * 1000 if i == 0 else "B" * 80, "published": ""}]}
+             for i in range(12)]
+    snapshot = copy.deepcopy(items)
+    result = excerpt_plan(items, 6000)
+    assert len(result[0][0]["snippet"]) == 1000
+    assert sum(len(e["snippet"]) for page in result for e in page) == 1880
+    assert items == snapshot
+    items[0]["evidence"].append(dict(items[0]["evidence"][0], source="keenable", snippet="supplement 0.5.4"))
+    result = excerpt_plan(items, 1880)
+    assert len(result[0]) == 1 and len(result[0][0]["snippet"]) == 1000
+    items[0]["evidence"][0]["published"] = "2026-11-27"
+    items[1]["evidence"][0]["dates"] = {"source_date": "2026-11-26"}
+    for budget in (0, 1, 2, 11, 12, 100, 6000):
+        result = excerpt_plan(items, budget)
+        assert sum(len(e["snippet"]) for page in result for e in page) <= budget
+    result = excerpt_plan(items, 6000)
+    assert result[0][0]["snippet"].startswith("发布 2026-11-27 | ")
+    assert result[1][0]["snippet"].startswith("来源时间 2026-11-26 | ")
+    assert excerpt_plan([], 100) == []
+    prefix = "This is the same explanatory background. " * 15
+    texts = [prefix + "HTTP port 8000 and HTTPS port 443.",
+             prefix + "HTTP port 443 and HTTPS port 8000."]
+    entries = [dict(source=source, url="https://example.com", snippet=text, published="")
+               for source, text in zip(("parallel", "keenable"), texts)]
+    assert len(excerpt_plan([{"evidence": entries}], 6000)[0]) == 2
+
+
+@case("0.5.4：数字精确匹配、混合 focus 和小预算命中定位")
+def t_numeric_focus():
+    from .reading import document_page
+    for term in ("0.5.3", "429", "8000"):
+        body = "Background " * 200 + "\n\nValue " + term + " TARGET_FACT"
+        result = document_page(body, 0, term, 80)
+        assert "TARGET_FACT" in result and "未匹配" not in result, result
+    assert "MIXED_FACT" in document_page("intro\n\nRelease 0.5.3 MIXED_FACT", 0, "release version 0.5.3", 80)
+    for term, body in (("429", "status 1429"), ("429", "status 4290"),
+                       ("0.5.3", "version 0.5.30"), ("8000", "port 18000")):
+        assert "未匹配" in document_page(body, 0, term, 100)
+    assert "未匹配" in document_page(" " * 1919 + "1429 tail", 0, "429", 100)
+    assert "MATCH_WORD" in document_page("x " * 900 + "MATCH_WORD", 0, "MATCH_WORD", 30)
+    assert "CROSSING_FACT" in document_page("x"*1997 + "BOUNDARY_WORD CROSSING_FACT" + "y"*2500,
+                                             0, "BOUNDARY_WORD", 100)
+    assert "未匹配" in document_page("1079", 0, " ".join(str(i) for i in range(1000, 1080)), 100)
+
+
+@case("0.5.4：标题上下文、跨边界去重与半开位置精确")
+def t_focus_overlap_offsets():
+    import re
+    from .reading import document_page
+    body = "# Authentication\n\nSet SECRET_TOKEN before starting."
+    start = body.index("Set")
+    result = document_page(body, start, "Authentication", 100)
+    assert "SECRET_TOKEN" in result and "未匹配" not in result
+    assert f"[{start}, {len(body)})" in result
+    for newline in ("\n", "\r\n"):
+        body = "# section" + newline*2 + "x"*1995 + "BOUNDARY_TERM" + "y"*2100
+        result = document_page(body, 0, "BOUNDARY_TERM", 3000)
+        assert "BOUNDARY_TERM" in result
+        matches = list(re.finditer(r"原文区间 \[(\d+), (\d+)\)\n", result))
+        intervals = []
+        for match in matches:
+            left, end = map(int, match.groups())
+            assert result[match.end():match.end()+end-left] == body[left:end]
+            assert all(end <= a or left >= b for a, b in intervals)
+            intervals.append((left, end))
+        assert sum(b-a for a,b in intervals) <= 3000
+    assert "已到末尾" in document_page("", 0, "test", 100)
+
+
+@case("0.5.4：GitHub .git、代理专用名与内置说明")
+def t_github_proxy_and_help():
+    from . import config, server
+    from .reading import github_repository
+    from .providers import _network_profile
+    assert github_repository("https://github.com/owner/repo.git/") == ("owner", "repo")
+    for value in (".git", "..git", "...git", ".", ".."):
+        assert github_repository("https://github.com/owner/" + value) is None
+    with config.use_settings(PROXY_PROVIDERS=frozenset({"github"}), SEARCH_PROXY="http://proxy.example:8080") as settings:
+        assert not any("github" in p for p in config.check_provider_names(settings))
+        assert _network_profile("github") == ("proxy", "http://proxy.example:8080")
+    with config.use_settings(FREE_PROVIDERS=("github",), FETCH_PREFERRED=("github",)) as settings:
+        warnings = config.check_provider_names(settings)
+        assert any("FREE_PROVIDERS" in p and "github" in p for p in warnings)
+        assert any("WEB_FETCH_PROVIDER" in p and "github" in p for p in warnings)
+    before, args = server._fetch_description().split("Args:", 1)
+    assert "GitHub" in before and "GitHub" not in args
+    assert "\n\n### 使用记录" in server.status_text()
+
+
+@case("0.5.4：CLI fetch 参数从正常入口透传，旧调用兼容")
+def t_cli_fetch_reading():
+    import io
+    from unittest.mock import AsyncMock
+    from contextlib import redirect_stdout
+    from . import cli, server
+    args = cli.build_parser().parse_args(["fetch", "https://example.com", "parallel"])
+    assert args.start_index == 0 and args.focus == ""
+    fetch = AsyncMock(return_value="fixture")
+    with patch.object(server, "web_fetch", fetch), redirect_stdout(io.StringIO()):
+        try:
+            cli.main(["fetch", "https://example.com", "parallel", "--start-index", "20000", "--focus", "429"])
+        except SystemExit as exc:
+            assert exc.code == 0
+        else:
+            raise AssertionError("CLI did not exit normally")
+    fetch.assert_awaited_once_with("https://example.com", "parallel", start_index=20000, focus="429")
+    from contextlib import redirect_stderr
+    with patch.object(server, "web_fetch", fetch), redirect_stderr(io.StringIO()):
+        assert cli.cmd_fetch("https://example.com", "parallel", -1) == 2
+    assert fetch.await_count == 1
+
+
+@case("0.5.4：参数类型与 focus/续读复用原文缓存")
+async def t_fetch_validation_and_cache():
+    from . import server
+    for kwargs in ({"url": []}, {"url": "https://example.com", "provider": 12},
+                   {"url": "https://example.com", "focus": None},
+                   {"url": "https://example.com", "start_index": True}):
+        assert "必须" in await server.web_fetch(**kwargs)
+    with patch.object(server, "run_fetch", side_effect=AssertionError("invalid URL must not make a request")):
+        for url in ("", "http://", "https://[", "https://host:wrong", "https://bad host/", "https://host:70000"):
+            assert "合法" in await server.web_fetch(url)
+    await server.web_fetch("https://example.com/page", "parallel")
+    with patch.object(server, "run_fetch", side_effect=AssertionError("cached document must be reused")):
+        result = await server.web_fetch("https://example.com/page", "parallel", 1, "429")
+        assert "缓存命中" in result
+
+
 async def _run_case(outcome) -> None:
     from . import providers
 

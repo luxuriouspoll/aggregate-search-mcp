@@ -164,10 +164,13 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_fetch(url: str, backend: str) -> int:
+def cmd_fetch(url: str, backend: str, start_index: int = 0, focus: str = "") -> int:
     from .server import web_fetch
 
-    print(asyncio.run(_run_once(web_fetch(url, backend))))
+    if start_index < 0:
+        print("--start-index 必须是非负整数。", file=sys.stderr)
+        return 2
+    print(asyncio.run(_run_once(web_fetch(url, backend, start_index=start_index, focus=focus))))
     return 0
 
 
@@ -324,6 +327,8 @@ def build_parser(*, private_errors: bool = False) -> argparse.ArgumentParser:
     p = sub.add_parser("fetch", help="抓取网页正文")
     p.add_argument("url")
     p.add_argument("backend", nargs="?", default="", help="可选，指定抓取后端")
+    p.add_argument("--start-index", type=int, default=0, help="从原文字符位置续读，默认 0")
+    p.add_argument("--focus", default="", help="按关键词筛选相关段落")
 
     p = sub.add_parser("check", help="让每家各发一次真实请求，检查连通性")
     p.add_argument("query", nargs="*", help="测试用的关键词")
@@ -367,7 +372,7 @@ def main(argv: list[str] | None = None) -> None:
     elif command == "search":
         code = cmd_search(args)
     elif command == "fetch":
-        code = cmd_fetch(args.url, args.backend)
+        code = cmd_fetch(args.url, args.backend, args.start_index, args.focus)
     elif command == "check":
         code = cmd_check(" ".join(args.query) or "Python 3.13 新特性")
     elif command == "selftest":

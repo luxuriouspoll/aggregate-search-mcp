@@ -922,12 +922,12 @@ def _fetch_description() -> str:
 
 未指定后端时按配置依次尝试，优先走匿名；某个后端失败或正文过短时会按策略复核。当前顺序及账号策略见 web_status。
 服务端禁止发送账号 key 时，指定后端也只能用匿名通道。
+GitHub 仓库首页优先匿名直取 README，具体 Issue/Release 等页面保持原目标。
 
 Args:
     url: 要抓取的网页地址（http / https）
     start_index: 非负字符位置，默认 0；顺序续读缓存原文，缓存失效会重新抓取。
     focus: 可选关键词，按相关性返回段落与原文位置；省略时顺序阅读。
-    GitHub 仓库首页优先匿名直取 README，具体 Issue/Release 等页面保持原目标。
     provider: 可选，只用指定后端；可选 {', '.join(FETCH_PROVIDERS)}
 """
 
@@ -956,8 +956,19 @@ async def web_fetch(url: str, provider: str | None = None, start_index: int = 0,
         return "start_index 必须是非负整数。"
     if not isinstance(focus, str):
         return "focus 必须是文本。"
-    url = (url or "").strip()
-    if not url.lower().startswith(("http://", "https://")):
+    if not isinstance(url, str):
+        return "url 必须是 http/https 地址文本。"
+    if provider is not None and not isinstance(provider, str):
+        return "provider 必须是文本。"
+    url = url.strip()
+    try:
+        target = urlsplit(url)
+        valid_url = target.scheme in ("http", "https") and bool(target.hostname)
+        valid_url = valid_url and not any(char.isspace() for char in target.hostname)
+        target.port  # Validate malformed and out-of-range ports before contacting providers.
+    except ValueError:
+        valid_url = False
+    if not valid_url:
         return "只支持合法的 http/https 链接。"
 
     # 显式指定后端时只试这一家；先确定账号策略，再尝试缓存。
@@ -1232,6 +1243,7 @@ def status_text(usage_days: int | None = 0) -> str:
     lines.append("")
 
     lines.append(f"- 单页展示 {settings.FETCH_MAX_CHARS} 字符；单文档缓存 {settings.FETCH_CACHE_MAX_CHARS} 字符；共享摘录预算 {settings.SEARCH_EXCERPT_MAX_CHARS} 字符")
+    lines.append("")
     lines.append("### 使用记录")
     if not settings.USAGE_LOG:
         lines.append("- 已关闭（USAGE_LOG=false）")
