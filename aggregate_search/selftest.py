@@ -579,7 +579,7 @@ async def t_escalate_mode():
     assert FAKES.calls and all(key for _, key in FAKES.calls), FAKES.calls
     assert _keyed() == ["volcengine", "querit", "tavily"], FAKES.calls
     assert "并入" in second and "parallel: 沿用此前结果" in second, second
-    assert "（6 家：" in second, second          # 匿名 3 家 + 补搜 3 家的证据合并到同一页面
+    assert "（6 个检索渠道，1 个原始页面：" in second, second          # 匿名 3 家 + 补搜 3 家的证据合并到同一页面
 
     FAKES.calls.clear()
     await server.web_search(query, search_mode="escalate")
@@ -2548,7 +2548,7 @@ def t_chinese_evidence_relevance():
     def pages(query, *snippets):
         item = {"url": "https://example.org/story", "evidence": [
             {"source": str(i), "snippet": s} for i, s in enumerate(snippets)]}
-        return assess_quality(query, [item]).metrics["相关独立页面"]
+        return assess_quality(query, [item]).metrics["相关独立原始页面"]
 
     query = "新能源汽车最新政策 2024 42%"
     assert pages(query, "能源用量 2024：42%") == 1
@@ -2838,10 +2838,13 @@ def _child_hot_reload() -> None:
                     **original, "TAVILY_API_KEYS": new_key, "DAILY_LIMITS": "jina:1",
                     "SEARCH_MODE": "free", "REGION_ROUTING": "global", "SEARCH_PROXY": new_proxy,
                     "FETCH_CACHE_TTL": "0", "WEB_FETCH_PROVIDER": "keenable",
+                    "FETCH_CACHE_MAX_CHARS": "50000", "SEARCH_EXCERPT_MAX_CHARS": "2500",
                 })
                 keys_file.unlink()
                 status = await server.web_status()
                 assert routing.detect_region("普通查询").region == "global"
+                assert config.get_settings().FETCH_CACHE_MAX_CHARS == 50000
+                assert config.get_settings().SEARCH_EXCERPT_MAX_CHARS == 2500
                 assert any("默认" in line and "free" in line for line in status.splitlines()), status
                 assert not providers.has_keys("exa") and config.get_settings().API_KEYS["perplexity"] == (client_key,)
                 assert config.get_settings().API_KEYS["tavily"] == (new_key,)
@@ -3434,6 +3437,148 @@ def t_cli_serve_options():
     assert args.transport == "streamable-http" and args.host == "0.0.0.0" and args.port == 9100
     default = parser.parse_args(["serve"])
     assert default.transport == "stdio" and default.host == "127.0.0.1" and default.port == 8000
+
+
+
+@case("0.5.3：续读保留 run_fetch 正文、缓存过期、参数与权限隔离")
+async def t_read_pages():
+    from . import config, providers, server
+    from .providers.base import FetchResult
+    document = "A" * 20000 + "SECOND_PAGE" + "B" * 2000
+    async def fixture(client, key, url):
+        return FetchResult("parallel", url, content=document)
+    with config.use_settings(FETCH_MAX_CHARS=20000, FETCH_CACHE_MAX_CHARS=100000, FETCH_CACHE_TTL=300):
+        with patch.dict(providers.REGISTRY, {"parallel": (providers.REGISTRY["parallel"][0], fixture)}):
+            raw = await providers.run_fetch("parallel", "https://example.com/long", True)
+            assert raw.content == document
+            first = await server.web_fetch("https://example.com/long", "parallel")
+            assert "SECOND_PAGE" not in first and "start_index=20000" in first
+            with patch.object(server, "run_fetch", side_effect=AssertionError("cache should avoid request")):
+                second = await server.web_fetch("https://example.com/long", "parallel", 20000)
+                assert "SECOND_PAGE" in second and "缓存命中" in second and "[20000, 22011)" in second
+            for key, (value, _) in list(server._FETCH_CACHE.items()):
+                server._FETCH_CACHE[key] = (value, 0)
+            again = await server.web_fetch("https://example.com/long", "parallel", 20000)
+            assert "SECOND_PAGE" in again and "缓存命中" not in again
+            assert "非负整数" in await server.web_fetch("https://example.com", start_index=-1)
+            assert "已到末尾" in await server.web_fetch("https://example.com/long", "parallel", 999999)
+    with config.use_settings(FETCH_CACHE_MAX_CHARS=1000):
+        with patch.dict(providers.REGISTRY, {"parallel": (providers.REGISTRY["parallel"][0], fixture)}):
+            raw = await providers.run_fetch("parallel", "https://example.com/long", True)
+            assert len(raw.content) == 1000 and raw.truncated
+
+
+@case("0.5.3：Keenable 向上游传缓存上限")
+async def t_keenable_cache_limit():
+    from . import config
+    from .providers import keenable
+    async def call(client, key, tool, args):
+        assert args["max_chars"] == 100000
+        return {"text": "x" * 25000}
+    with config.use_settings(FETCH_MAX_CHARS=20000, FETCH_CACHE_MAX_CHARS=100000):
+        with patch.object(keenable, "_call", side_effect=call):
+            result = await keenable.fetch(None, "", "https://example.com")
+            assert len(result.content) == 25000
+
+
+@case("0.5.3：focus 命中后半段并保留位置，默认顺序不变")
+def t_document_focus():
+    from .reading import document_page
+    content = ("无关内容" + chr(10)*2) * 5000 + chr(10) + "## 配置代理" + chr(10)*2 + "设置 HTTP_PROXY 即可。" + chr(10)*2 + "## 其它" + chr(10)*2 + "普通内容"
+    offset = content.index("设置 HTTP_PROXY")
+    focused = document_page(content, 0, "配置代理", 120)
+    assert "HTTP_PROXY" in focused and f"[{offset}," in focused, focused
+    sequential = document_page(content, 0, "", 30)
+    assert content[:30] in sequential and "HTTP_PROXY" not in sequential
+    assert "未匹配" in document_page(content, 0, "unmatched-token", 30)
+
+
+@case("0.5.3：GitHub README 主机、原始引用、子路径和重定向")
+async def t_github_reading():
+    import httpx
+    from . import config, providers, server
+    from .reading import github_repository, github_readme
+    url = "https://github.com/owner/repo"
+    for bad in ("http://github.com/a/b", "https://github.com.evil/a/b", "https://evil/a/b",
+                "https://user@github.com/a/b", url + "/issues", url + "/releases", url + "/blob/main/a",
+                "https://github.com/a/..", "https://github.com:444/a/b"):
+        assert github_repository(bad) is None, bad
+    seen = []
+    def handler(request):
+        seen.append(str(request.url))
+        assert request.url.host == "raw.githubusercontent.com" and "authorization" not in request.headers
+        if request.url.path.endswith("README.md"):
+            return httpx.Response(404)
+        return httpx.Response(200, text="# Project" + chr(10)*2 + "content " * 100)
+    from contextlib import asynccontextmanager
+    @asynccontextmanager
+    async def client_for(name):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            yield client
+    with patch.object(providers, "client_for", client_for):
+        result = await github_readme(url)
+        assert result.url == url and len(seen) == 2
+        output = await server.web_fetch(url)
+        assert f'url="{url}"' in output and "README 匿名直取" in output
+        assert "raw.githubusercontent.com" not in output
+        assert await github_readme(url + "/issues/1") is None
+    def redirect(request):
+        return httpx.Response(302, headers={"location": "https://evil.example/"})
+    @asynccontextmanager
+    async def redirects(name):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(redirect)) as client:
+            yield client
+    with patch.object(providers, "client_for", redirects):
+        assert await github_readme(url) is None
+
+
+@case("0.5.3：共享预算、版本差异和 SearXNG 溯源保持一个上游")
+async def t_excerpt_provenance():
+    import httpx
+    from . import config, server
+    from .excerpts import excerpt_plan
+    from .providers.base import SearchResult, merge_results
+    from .providers import searxng
+    from .quality import assess_quality
+    with config.use_settings(SEARXNG_BASE_URL="https://search.example"):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={
+            "results": [{"url": "https://example.com/a", "title": "MCP", "content": "MCP version 0.5.2",
+                         "engines": ["github", "brave"]}]}))) as client:
+            result = await searxng.search(client, "", "MCP", 5)
+    result += [SearchResult("parallel", "https://example.com/a", "MCP", "MCP version 0.5.2"),
+               SearchResult("keenable", "https://example.com/a", "MCP", "MCP version 0.5.3")]
+    merged = merge_results({"all": result})
+    plan = excerpt_plan(merged, 100)
+    assert sum(len(e["snippet"]) for page in plan for e in page) <= 100
+    assert len(plan[0]) == 2 and "0.5.3" in plan[0][1]["snippet"]
+    rendered = server._format_search("MCP", merged, "", [], [], {}, {})
+    assert "github / brave" in rendered and "检索渠道数 3" in rendered
+    assert "独立原始页面（近似转载折叠后）1" in rendered
+    report = assess_quality("MCP", merged)
+    assert report.metrics["检索渠道数"] == 3
+    assert merged[0]["source_count"] == 3
+
+
+@case("0.5.3：缓存总量与流式响应大小上限")
+async def t_reading_limits():
+    import httpx
+    from . import config, server, providers
+    from .providers.base import FetchResult, ProviderError
+    with config.use_settings(FETCH_CACHE_TTL=300):
+        for i in range(50):
+            server._fetch_cache_put((i,), FetchResult("parallel", str(i), content="x"*100000))
+        assert sum(len(v[0].content) for v in server._FETCH_CACHE.values()) <= 4000000
+    class Oversize(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(9):
+                yield b"x" * 1000000
+    response = httpx.Response(200, stream=Oversize(), request=httpx.Request("GET", "https://example.com"))
+    try:
+        await providers._bound_response(response)
+    except ProviderError:
+        assert response.is_closed
+    else:
+        raise AssertionError("oversized body accepted")
 
 
 async def _run_case(outcome) -> None:

@@ -61,6 +61,7 @@ class SearchResult:
     rank: int = 99     # 在该提供商结果中的原始名次（0 起），用于合并排序
     published: str = ""  # 仅字段语义明确为发布日期时填写
     dates: tuple[tuple[str, str], ...] = ()  # 上游的其他日期及其类型，不假称发布
+    engines: tuple[str, ...] = ()
 
 
 @dataclass
@@ -70,6 +71,7 @@ class FetchResult:
     title: str = ""
     content: str = ""
     auth: str = ""     # 由调度层填写：anon（匿名）/ key（用了账号 key）
+    truncated: bool = False
 
 
 def redact(text: str) -> str:
@@ -251,7 +253,7 @@ async def get_text(
 
 def truncate(text: str) -> str:
     """抓取正文统一截断，避免撑爆模型上下文。"""
-    limit = config.get_settings().FETCH_MAX_CHARS
+    limit = config.get_settings().FETCH_CACHE_MAX_CHARS
     if len(text) > limit:
         return text[:limit] + "\n\n…（内容过长，已截断）"
     return text
@@ -488,6 +490,7 @@ def merge_results(groups: dict[str, list[SearchResult]]) -> list[dict]:
                 "snippet": snippet,
                 "published": published,
                 "dates": dict(r.dates),
+                "engines": list(r.engines),
             })
             item["titles"] = _dedupe_text(item["titles"] + [title])
             item["snippets"] = _dedupe_text(item["snippets"] + [snippet])

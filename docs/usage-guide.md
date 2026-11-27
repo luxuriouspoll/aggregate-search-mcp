@@ -1,25 +1,25 @@
 # aggregate-search 使用指南
 
-适用于 **v0.5.2**。本指南从升级或安装开始，走到在 MCP 客户端里完成第一次搜索。想先看项目原理、支持的厂商和完整配置，见 [项目介绍（README）](../README.md)。
+适用于 **v0.5.3**。本指南从升级或安装开始，走到在 MCP 客户端里完成第一次搜索。想先看项目原理、支持的厂商和完整配置，见 [项目介绍（README）](../README.md)。
 
 ## 1. 已有 0.5.0：不删旧 MCP，就地升级
 
-这套步骤同样适用于从 0.5.1 升级。
+这套步骤同样适用于从 0.5.1 或 0.5.2 升级。
 
 如果客户端已经把启动命令设成 `aggregate-search`，**保留原来的 MCP 注册项**。升级只替换程序，不需要重新填 Key，也不要删除 `.env`、`keys.json`、`state.db` 或 `usage.jsonl`。
 
 1. 在 ZCode 等客户端里停用或断开 `aggregate-search`。Windows 上如果断开后仍占用文件，退出使用这个 MCP 的客户端再升级；远程 HTTP 常驻实例则要停掉实际的服务进程。
-2. 在 PowerShell 进入**已更新到 0.5.2 的本地仓库根目录**（里面有 `pyproject.toml`）。把下面示例路径换成你自己的：
+2. 在 PowerShell 进入**已更新到 0.5.3 的本地仓库根目录**（里面有 `pyproject.toml`）。把下面示例路径换成你自己的：
 
    ```powershell
    Set-Location 'D:\projects\aggregate-search-mcp'
    uv tool install --force --reinstall .
    ```
 
-   如果不使用本地源码，而是直接安装 GitHub 上的发布版，用下面这条替代（不要两条都执行；想跟随开发主分支可把 `@v0.5.2` 换成 `@master`）：
+   如果不使用本地源码，而是直接安装 GitHub 上的发布版，用下面这条替代（不要两条都执行；想跟随开发主分支可把 `@v0.5.3` 换成 `@master`）：
 
    ```powershell
-   uv tool install --force --reinstall 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.2'
+   uv tool install --force --reinstall 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.3'
    ```
 
 3. **先在终端验收，再回客户端重连原来的注册项**：
@@ -31,7 +31,7 @@
    aggregate-search status
    ```
 
-   该版本应打印 `aggregate-search 0.5.2`；`path` 应是原来的配置目录；`selftest` 应全部通过；`status` 用来确认原配置仍被读取，并查看厂商、用量、硬锁和代理模式。`selftest` 不联网也不读真实配置；`status` 不向厂商发请求，但可能在本地初始化或迁移状态库。
+   该版本应打印 `aggregate-search 0.5.3`；`path` 应是原来的配置目录；`selftest` 应全部通过；`status` 用来确认原配置仍被读取，并查看厂商、用量、硬锁和代理模式。`selftest` 不联网也不读真实配置；`status` 不向厂商发请求，但可能在本地初始化或迁移状态库。
 
 > **什么时候才需要改 MCP 注册项？** 如果旧命令是 `uvx`，它不会使用刚装好的 `aggregate-search`：可以更新原有 `uvx` 指向的 Git 版本，或直接把原注册项改成 `aggregate-search`。如果客户端写死了旧虚拟环境的路径，也只需把命令改为新版入口；无需先删再建。Windows 用 `where.exe aggregate-search` 查看程序路径。使用 `pipx` 或自建虚拟环境安装过的，优先用原安装工具更新，避免 PATH 上同时出现两个版本。
 
@@ -42,7 +42,7 @@
 使用 [uv](https://docs.astral.sh/uv/getting-started/installation/)，在 PowerShell 或终端先装好命令并写入系统 `PATH`：
 
 ```powershell
-uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.2'
+uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.3'
 uv tool update-shell
 ```
 
@@ -133,3 +133,20 @@ aggregate-search reset-cooldown tavily --apply   # 确认后才执行
 | 保存 `.env` 后没效果 | 用 `path` 和 `status` 核对读取的是哪个目录，检查客户端是否注入了同名配置。目录、日志路径、HTTP 鉴权 Token 或监听参数仍需要重启服务。 |
 
 版本变化见 [CHANGELOG](../CHANGELOG.md)。请勿把实际 `.env`、`keys.json`、日志或状态库提交到 GitHub。
+
+
+## 0.5.3 原文阅读与证据摘录
+
+三个 MCP 工具继续为 `web_search`、`web_fetch`、`web_status`。
+
+`web_fetch(url, provider=None, start_index=0, focus="")` 支持按字符位置续读。默认返回正文前 20000 字符，输出给出半开区间和下一页起点。将返回的起点传入 `start_index` 即可顺序阅读。位置按缓存中已脱敏文本的 Python 字符计数，适用于中文。超出末尾会明确提示。
+
+显式传入 `focus="配置代理"` 时，用标准库词频相关性筛选段落并标出原文位置。省略 focus 时按原文顺序输出。选择位置可再用 start_index 阅读上下文。
+
+`FETCH_CACHE_MAX_CHARS=100000` 控制每份缓存正文与支持该参数的上游抓取长度，`FETCH_MAX_CHARS=20000` 控制每次展示长度。达到缓存上限时提示可能还有内容。上游服务也可能仅提供部分正文，已获取长度代表本次可读文本。缓存最多 64 条、总正文 400 万字符，TTL 默认 300 秒。只有命中仍有效且满足当前账号策略的缓存时，续读才零额外请求；过期、淘汰或配置变化会重新抓取，网页更新后位置可能变化。
+
+标准 HTTPS GitHub 仓库首页优先从 raw.githubusercontent.com 的 HEAD 分支直取 README，兼容 README.md、readme.md、README.rst、README 和 README.MD。原始 github.com 引用保留。指定 provider 时尊重该后端；Issue、PR、Release、blob 和 tree 页面按原目标抓取。直取不调用 GitHub REST API，拒绝跳转，限制 2 MB 下载；其他后端解码响应上限为 8 MB。
+
+`SEARCH_EXCERPT_MAX_CHARS=6000` 是单次搜索共享摘录预算。先给独立页面分配主摘要，再补充有差异的摘要，保留版本、日期与全部命中渠道。预算只限制摘录文本，标题、来源和审计信息另计。检索渠道数与转载折叠后的原始页面数分别展示，跨渠道命中同页继续沿用原有 auto 判断标准。SearXNG 可展示底层引擎名称，调度和计费仍算单个上游。
+
+上述三个长度配置均支持热加载。离线评测见仓库 evals/README.md。

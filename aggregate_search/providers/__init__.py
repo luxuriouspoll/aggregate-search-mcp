@@ -231,6 +231,20 @@ async def _keep_keys_on_host(response: httpx.Response) -> None:
         )
 
 
+async def _bound_response(response: httpx.Response) -> None:
+    # httpx response hooks run before eager buffering. Bound decoded bytes as well.
+    parts = []
+    size = 0
+    limit = 2_000_000 if response.request.url.host == "raw.githubusercontent.com" else 8_000_000
+    async for chunk in response.aiter_bytes():
+        size += len(chunk)
+        if size > limit:
+            await response.aclose()
+            raise ProviderError(f"响应体超过 {limit} 字节上限")
+        parts.append(chunk)
+    response._content = b"".join(parts)
+
+
 _NetworkProfile = tuple[str, str | bool]
 
 
@@ -247,7 +261,7 @@ def _client_kwargs(profile: _NetworkProfile) -> dict:
     kwargs: dict = {
         "follow_redirects": True,
         "verify": ssl_context(),
-        "event_hooks": {"request": [_guard_account_request], "response": [_keep_keys_on_host]},
+        "event_hooks": {"request": [_guard_account_request], "response": [_keep_keys_on_host, _bound_response]},
     }
     if kind == "proxy":
         kwargs.update(proxy=value, trust_env=False)
@@ -714,7 +728,8 @@ async def run_fetch(name: str, url: str, anonymous: bool = False) -> FetchResult
         # 「成功但什么都没抓到」对调用方没有用，按失败处理，好让上层换下一个后端
         raise ProviderError(f"{name} 抓取成功但正文为空")
     result.auth = auth
-    result.content = truncate(result.content)
+    result.truncated = result.truncated or len(result.content) > config.get_settings().FETCH_CACHE_MAX_CHARS
+    result.content = result.content[:config.get_settings().FETCH_CACHE_MAX_CHARS]
     return result
 
 

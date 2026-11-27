@@ -1,5 +1,7 @@
 # aggregate-search-mcp
 
+[English](README_EN.md) · 简体中文
+
 [![CI](https://github.com/luxuriouspoll/aggregate-search-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/luxuriouspoll/aggregate-search-mcp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/luxuriouspoll/aggregate-search-mcp)](https://github.com/luxuriouspoll/aggregate-search-mcp/releases)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
@@ -83,14 +85,14 @@
 推荐从固定发布标签安装（也可从 [Releases](https://github.com/luxuriouspoll/aggregate-search-mcp/releases) 下载 `.whl` 安装）：
 
 ```bash
-uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.2'
+uv tool install 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.3'
 uv tool update-shell                # 首次用 uv 装全局工具必跑：把 ~/.local/bin 写入系统 PATH
 ```
 
 > **Windows / 新装 `uv` 防坑提示**：首次用 `uv tool install` 安装工具时，末尾常提示 `` `C:\Users\...\.local\bin` is not on your PATH ``，此时直接在当前窗口运行 `aggregate-search` 会报“无法将‘aggregate-search’项识别为 cmdlet…”。执行一次上面的 `uv tool update-shell`，然后**关掉并重新打开终端窗口**（已打开的旧窗口和桌面客户端不会自动刷新 `PATH`），再验证版本：
 
 ```bash
-aggregate-search --version          # 显示 aggregate-search 0.5.2
+aggregate-search --version          # 显示 aggregate-search 0.5.3
 ```
 
 想跟随开发主分支可用 `@master`；也可克隆仓库后在根目录用 `uv tool install .` 或 `pipx install .`（虚拟环境内用 `python -m pip install .`）。
@@ -128,7 +130,7 @@ aggregate-search search "MCP 是什么"      # 真的搜一次
 
 ```bash
 # 升级到最新固定发布版（推荐，不需要先克隆）
-uv tool install --force --reinstall 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.2'
+uv tool install --force --reinstall 'git+https://github.com/luxuriouspoll/aggregate-search-mcp@v0.5.3'
 
 # 或在已更新的本地源码仓库根目录执行
 uv tool install --force --reinstall .
@@ -548,7 +550,9 @@ Perplexity 默认**不参与自动补搜**（它每次搜索是一次大模型�
 | `FETCH_MIN_CHARS` | `200` | 正文短于这个长度就换一家复核（只复核一次）；`0` 关闭 |
 | `FETCH_KEYED_FALLBACKS` | `2` | 免费后端都失败后，最多再试几个带 key 的后端 |
 | `FETCH_CACHE_TTL` | `300` | 抓取缓存有效期（秒）；`0` = 不缓存 |
-| `FETCH_MAX_CHARS` | `20000` | 正文截断长度 |
+| `FETCH_MAX_CHARS` | `20000` | 单次原文展示上限 |
+| `FETCH_CACHE_MAX_CHARS` | `100000` | 单文档缓存与上游抓取上限，热加载 |
+| `SEARCH_EXCERPT_MAX_CHARS` | `6000` | 所有页面共享的摘录字符预算，热加载 |
 
 ### 网络
 
@@ -774,3 +778,20 @@ python -m venv .venv
 [MIT](LICENSE) © 2026 luxuriouspoll
 
 可以自由使用、修改、分发，包括商用；保留版权声明即可。软件按"现状"提供，不附带任何担保。
+
+
+## 0.5.3 原文阅读与证据摘录
+
+三个 MCP 工具继续为 `web_search`、`web_fetch`、`web_status`。
+
+`web_fetch(url, provider=None, start_index=0, focus="")` 支持按字符位置续读。默认返回正文前 20000 字符，输出给出半开区间和下一页起点。将返回的起点传入 `start_index` 即可顺序阅读。位置按缓存中已脱敏文本的 Python 字符计数，适用于中文。超出末尾会明确提示。
+
+显式传入 `focus="配置代理"` 时，用标准库词频相关性筛选段落并标出原文位置。省略 focus 时按原文顺序输出。选择位置可再用 start_index 阅读上下文。
+
+`FETCH_CACHE_MAX_CHARS=100000` 控制每份缓存正文与支持该参数的上游抓取长度，`FETCH_MAX_CHARS=20000` 控制每次展示长度。达到缓存上限时提示可能还有内容。上游服务也可能仅提供部分正文，已获取长度代表本次可读文本。缓存最多 64 条、总正文 400 万字符，TTL 默认 300 秒。只有命中仍有效且满足当前账号策略的缓存时，续读才零额外请求；过期、淘汰或配置变化会重新抓取，网页更新后位置可能变化。
+
+标准 HTTPS GitHub 仓库首页优先从 raw.githubusercontent.com 的 HEAD 分支直取 README，兼容 README.md、readme.md、README.rst、README 和 README.MD。原始 github.com 引用保留。指定 provider 时尊重该后端；Issue、PR、Release、blob 和 tree 页面按原目标抓取。直取不调用 GitHub REST API，拒绝跳转，限制 2 MB 下载；其他后端解码响应上限为 8 MB。
+
+`SEARCH_EXCERPT_MAX_CHARS=6000` 是单次搜索共享摘录预算。先给独立页面分配主摘要，再补充有差异的摘要，保留版本、日期与全部命中渠道。预算只限制摘录文本，标题、来源和审计信息另计。检索渠道数与转载折叠后的原始页面数分别展示，跨渠道命中同页继续沿用原有 auto 判断标准。SearXNG 可展示底层引擎名称，调度和计费仍算单个上游。
+
+上述三个长度配置均支持热加载。离线评测见仓库 evals/README.md。

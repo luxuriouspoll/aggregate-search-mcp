@@ -48,6 +48,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
     return [
         SearchResult(
             source="searxng",
+            engines=_engines(item),
             url=text_of(item.get("url")),
             title=text_of(item.get("title")),
             snippet=text_of(item.get("content")),
@@ -57,3 +58,12 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
         for i, item in enumerate(as_items(data, "results"))
         if text_of(item.get("url"))
     ][:max_results]
+
+
+def _engines(item: dict) -> tuple[str, ...]:
+    values = item.get("engines", item.get("engine", []))
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return ()
+    return tuple(dict.fromkeys(v[:80] for v in values[:20] if isinstance(v, str) and v.strip()))

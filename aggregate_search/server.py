@@ -66,6 +66,8 @@ from .providers.base import (
     scrub_urls,
 )
 from .quality import assess_quality
+from .reading import document_page, github_readme
+from .excerpts import excerpt_plan
 from .routing import REGION_LABELS, RegionDecision, normalize_region, order_escalation
 
 mcp = FastMCP("aggregate-search")
@@ -134,7 +136,7 @@ def _fetch_cache_put(key: tuple, result) -> None:
         return
     _FETCH_CACHE[key] = (result, time.monotonic())
     _FETCH_CACHE.move_to_end(key)
-    while len(_FETCH_CACHE) > _FETCH_CACHE_MAX:
+    while len(_FETCH_CACHE) > _FETCH_CACHE_MAX or sum(len(v[0].content) for v in _FETCH_CACHE.values()) > 4_000_000:
         _FETCH_CACHE.popitem(last=False)
 
 
@@ -472,10 +474,13 @@ def _markdown_link(label: str, url: str) -> str:
     return f"[{text}]({destination})"
 
 
-def _fetch_evidence(result) -> str:
+def _fetch_evidence(result, start_index=0, focus='') -> str:
     title = f"# {_markdown_label(result.title)}\n\n" if result.title else ""
     url = _markdown_link(result.url, result.url)
-    return _wrap_untrusted(f"{title}{url}\n\n{result.content}", result.provider, result.url)
+    page = document_page(result.content, start_index, focus, config.get_settings().FETCH_MAX_CHARS)
+    if getattr(result, "truncated", False):
+        page += "\n正文达到缓存上限；上游文档可能还有内容。"
+    return _wrap_untrusted(f"{title}{url}\n\n{page}", result.provider, result.url)
 
 
 def _untrusted_notice() -> str:
@@ -495,16 +500,19 @@ def _format_search(
     carried: dict[str, int],
 ) -> str:
     lines = [f"## 联网搜索统一汇总：{_markdown_label(query)}", "", headline, "", _untrusted_notice()]
+    plans = excerpt_plan(merged, config.get_settings().SEARCH_EXCERPT_MAX_CHARS)
+    channel_count = len({source for item in merged for source in item["sources"]})
+    lines.append(f"检索渠道数 {channel_count}；独立原始页面（近似转载折叠后）{len(merged)}。跨渠道命中同页表示检索一致性。")
     consensus = [item for item in merged if item.get("consensus_source_count", item["source_count"]) >= 2]
     if consensus:
         lines.append("")
-        lines.append("### 多源共识")
+        lines.append("### 多渠道命中同页")
         for item in consensus[:5]:
             sources = ", ".join(item.get("consensus_sources", item["sources"]))
             count = item.get("consensus_source_count", item["source_count"])
             label = _markdown_label(item["title"] or item["url"])
             url = item.get("consensus_url", item["url"])
-            lines.append(f"- {_wrap_untrusted(label, sources, url)}（{count} 家：{sources}）")
+            lines.append(f"- {_wrap_untrusted(label, sources, url)}（{count} 个检索渠道，1 个原始页面：{sources}）")
     lines.append("")
     lines.extend(["### 质量门禁与成本审计", *audit, ""])
     lines.append("### 去重后的证据列表")
@@ -515,29 +523,18 @@ def _format_search(
         link = _markdown_link(title, item["url"])
         lines.append(f"{i}. {_wrap_untrusted(link, ', '.join(item['sources']), item['url'])}")
         # 按来源展示证据，折叠后的摘要仍能追溯到具体 URL。
-        evidence = []
-        seen_evidence = set()
-        for entry in item["evidence"]:
-            key = (entry["source"], entry["url"], entry["snippet"], entry["published"])
-            if key not in seen_evidence:
-                seen_evidence.add(key)
-                evidence.append(entry)
-        for entry in evidence[:3]:
-            snippet = redact(entry["snippet"])
-            suffix = "…[摘要截断]" if len(snippet) > 500 else ""
-            date = entry["published"]
-            date_label = "发布"
-            if not date:
-                dates = entry.get("dates", {})
-                date = dates.get("source_date", "") or dates.get("page_age", "")
-                date_label = "来源时间"
-            body = (f"{date_label}: {_markdown_label(date)} ｜ " if date else "") + snippet[:500] + suffix
-            lines.append(f"   - **{entry['source']}**: " + _wrap_untrusted(body, entry["source"], entry["url"]))
-            if entry["url"] != item["url"]:
-                link = _markdown_link(entry["url"], entry["url"])
-                lines.append("     证据 URL: " + _wrap_untrusted(link, entry["source"], entry["url"]))
-        if len(evidence) > 3:
-            lines.append(f"   - 另有 {len(evidence) - 3} 条同源/转载证据因单页展示预算省略")
+        evidence = plans[i - 1]
+        for entry in evidence:
+            labels = []
+            for source in entry["channels"]:
+                if source == "searxng" and entry.get("engines"):
+                    source += " (" + " / ".join(entry["engines"]) + ")"
+                labels.append(source)
+            label = ", ".join(labels)
+            body = redact(entry["snippet"])
+            lines.append("   - " + _wrap_untrusted(label + ": " + body, entry["source"], entry["url"]))
+        if not evidence:
+            lines.append("   - 摘录预算已用完，可用 web_fetch 阅读原文。")
         meta = "来源: " + ", ".join(item["sources"])
         if item["published_dates"]:
             dates = item["published_dates"]
@@ -928,6 +925,9 @@ def _fetch_description() -> str:
 
 Args:
     url: 要抓取的网页地址（http / https）
+    start_index: 非负字符位置，默认 0；顺序续读缓存原文，缓存失效会重新抓取。
+    focus: 可选关键词，按相关性返回段落与原文位置；省略时顺序阅读。
+    GitHub 仓库首页优先匿名直取 README，具体 Issue/Release 等页面保持原目标。
     provider: 可选，只用指定后端；可选 {', '.join(FETCH_PROVIDERS)}
 """
 
@@ -947,11 +947,15 @@ def _loggable_url(url: str) -> str:
 
 @mcp.tool(description=_fetch_description())
 @config.with_runtime_settings
-async def web_fetch(url: str, provider: str | None = None) -> str:
+async def web_fetch(url: str, provider: str | None = None, start_index: int = 0, focus: str = "") -> str:
     """抓取网页正文。给模型看的说明见 _fetch_description()。"""
     settings = config.get_settings()
     started = time.monotonic()
     deadline = started + settings.TOTAL_TIMEOUT
+    if type(start_index) is not int or start_index < 0:
+        return "start_index 必须是非负整数。"
+    if not isinstance(focus, str):
+        return "focus 必须是文本。"
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         return "只支持合法的 http/https 链接。"
@@ -976,8 +980,21 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
             "auth": cached.auth, "chars": len(cached.content), "cache_hit": True, "attempts": [],
             "elapsed_ms": int((time.monotonic() - started) * 1000),
         })
-        prefix = f"抓取后端: {cached.provider}（缓存命中，{settings.FETCH_CACHE_TTL} 秒内有效）\n\n"
-        return prefix + _untrusted_notice() + "\n\n" + _fetch_evidence(cached)
+        prefix = f"抓取后端: {cached.provider}（缓存命中，零额外 HTTP 请求，{settings.FETCH_CACHE_TTL} 秒内有效）\n\n"
+        return prefix + _untrusted_notice() + "\n\n" + _fetch_evidence(cached, start_index, focus)
+    if not explicit:
+        try:
+            direct = await asyncio.wait_for(github_readme(url), timeout=min(settings.SEARCH_TIMEOUT, max(0.1, deadline - time.monotonic())))
+        except (asyncio.TimeoutError, ProviderError):
+            direct = None
+        if direct is not None:
+            _fetch_cache_put(cache_key, direct)
+            usage.log_event({"tool": "web_fetch", "url": _loggable_url(url), "backend": "github",
+                             "auth": "anon", "cache_hit": False, "chars": len(direct.content),
+                             "attempts": [{"p": "github", "auth": "anon", "ok": True}],
+                             "elapsed_ms": int((time.monotonic() - started) * 1000)})
+            return "抓取后端: github（README 匿名直取）\n\n" + _untrusted_notice() + "\n\n" + _fetch_evidence(direct, start_index, focus)
+
 
     failures: list[str] = []
     attempts: list[dict] = []
@@ -1091,7 +1108,7 @@ async def web_fetch(url: str, provider: str | None = None) -> str:
                 "页面可能本身很短，也可能需要登录或有反爬。可用 provider 参数指定后端再试。\n\n"
             )
     _fetch_cache_put(cache_key, best)
-    return prefix + _untrusted_notice() + "\n\n" + _fetch_evidence(best)
+    return prefix + _untrusted_notice() + "\n\n" + _fetch_evidence(best, start_index, focus)
 
 
 # ---------------------------------------------------------------------------
@@ -1214,6 +1231,7 @@ def status_text(usage_days: int | None = 0) -> str:
     lines.append(f"- 单家超时 {settings.SEARCH_TIMEOUT:g} 秒；一次搜索 / 抓取的总时限 {settings.TOTAL_TIMEOUT:g} 秒")
     lines.append("")
 
+    lines.append(f"- 单页展示 {settings.FETCH_MAX_CHARS} 字符；单文档缓存 {settings.FETCH_CACHE_MAX_CHARS} 字符；共享摘录预算 {settings.SEARCH_EXCERPT_MAX_CHARS} 字符")
     lines.append("### 使用记录")
     if not settings.USAGE_LOG:
         lines.append("- 已关闭（USAGE_LOG=false）")

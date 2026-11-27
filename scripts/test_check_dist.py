@@ -37,7 +37,7 @@ class CheckDistTests(unittest.TestCase):
                        "aggregate_search/templates/env.example": b"# empty template\n",
                        "aggregate_search/templates/keys.example.json": b"{}\n"})
         self.source = {**common, "PKG-INFO": metadata, f"{self.egg}/entry_points.txt": ENTRY_POINTS,
-                       "LICENSE": b"MIT", "pyproject.toml": b"[project]\n", "README.md": b"readme",
+                       "LICENSE": b"MIT", "pyproject.toml": b"[project]\n", "README.md": b"readme", "README_EN.md": b"english",
                        "CHANGELOG.md": b"changes", "docs/usage-guide.md": b"guide"}
         self.binary = {**common, f"{self.info}/METADATA": metadata, f"{self.info}/entry_points.txt": ENTRY_POINTS,
                        f"{self.info}/RECORD": b"", f"{self.info}/WHEEL": b"Wheel-Version: 1.0\n"}

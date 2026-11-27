@@ -434,6 +434,8 @@ class RuntimeSettings:
     DEFAULT_MAX_RESULTS: int
     SEARCH_TIMEOUT: float
     FETCH_MAX_CHARS: int
+    FETCH_CACHE_MAX_CHARS: int
+    SEARCH_EXCERPT_MAX_CHARS: int
     TOTAL_TIMEOUT: float
     MAX_RESULTS_CAP: int
     TOTAL_RESULTS: int
@@ -524,6 +526,8 @@ def _build_settings(
         DEFAULT_MAX_RESULTS=number("MAX_RESULTS", 5, int, minimum=1),
         SEARCH_TIMEOUT=number("SEARCH_TIMEOUT", 15.0, float, minimum=1.0),
         FETCH_MAX_CHARS=number("FETCH_MAX_CHARS", 20000, int, minimum=1000),
+        FETCH_CACHE_MAX_CHARS=number("FETCH_CACHE_MAX_CHARS", 100000, int, minimum=1000),
+        SEARCH_EXCERPT_MAX_CHARS=number("SEARCH_EXCERPT_MAX_CHARS", 6000, int, minimum=100),
         TOTAL_TIMEOUT=number("TOTAL_TIMEOUT", 45.0, float, minimum=5.0),
         MAX_RESULTS_CAP=number("MAX_RESULTS_CAP", 20, int, minimum=1),
         TOTAL_RESULTS=number("TOTAL_RESULTS", 12, int, minimum=1),

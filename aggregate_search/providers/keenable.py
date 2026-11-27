@@ -123,7 +123,7 @@ async def search(client: httpx.AsyncClient, key: str, query: str, max_results: i
 
 async def fetch(client: httpx.AsyncClient, key: str, url: str) -> FetchResult:
     payload = await _call(client, key, "fetch_page_content", {
-        "urls": [url], "max_chars": get_settings().FETCH_MAX_CHARS, "live": True,
+        "urls": [url], "max_chars": get_settings().FETCH_CACHE_MAX_CHARS, "live": True,
     })
     text = payload["text"]
     structured = payload.get("structured") or {}
@@ -132,4 +132,5 @@ async def fetch(client: httpx.AsyncClient, key: str, url: str) -> FetchResult:
     match = re.search(r"^Title:\s*(.+)$", text, re.M)
     if match and not title:
         title = match.group(1).strip()
-    return FetchResult(provider="keenable", url=url, title=title, content=content)
+    return FetchResult(provider="keenable", url=url, title=title, content=content,
+                       truncated=len(content) >= get_settings().FETCH_CACHE_MAX_CHARS)

@@ -138,12 +138,12 @@ def assess_quality(query: str, items: list[dict], errors: dict | None = None) ->
                             for entry in item["evidence"]) for item in relevant)
     complex_query = is_complex_query(query)
     metrics = {
-        "相关独立页面": unique,
+        "相关独立原始页面": unique,
         "有效证据": evidence_count,
-        "跨源共识页面": consensus,
-        "三源共识页面": strong_consensus,
+        "多渠道命中同页数": consensus,
+        "三渠道命中同页数": strong_consensus,
         "官方一手来源": official_hits,
-        "有效厂商": len(sources),
+        "检索渠道数": len(sources),
         "复杂查询": "是" if complex_query else "否",
     }
     reasons: list[str] = []
@@ -160,7 +160,7 @@ def assess_quality(query: str, items: list[dict], errors: dict | None = None) ->
         and strong_consensus < settings.AUTO_MIN_CONSENSUS
         and official_hits < 1
     ):
-        gaps.append(f"复杂/时效性查询既无三源共识，也无官方一手来源（{strong_consensus} 个三源页面）")
+        gaps.append(f"复杂/时效性查询既无三渠道命中同页，也无官方一手来源（{strong_consensus} 个三源页面）")
     if not relevant and items:
         gaps.append("返回内容与查询关键词匹配度低")
     if not items:
@@ -173,9 +173,9 @@ def assess_quality(query: str, items: list[dict], errors: dict | None = None) ->
     if not gaps:
         reasons.append("独立页面和证据数量达到门槛")
         if consensus:
-            reasons.append(f"有 {consensus} 个页面获得多家来源交叉命中")
+            reasons.append(f"有 {consensus} 个页面获得多个检索渠道交叉命中")
         if official_hits:
-            reasons.append(f"有 {official_hits} 个官方一手来源，可作为三源共识的补充证据")
+            reasons.append(f"有 {official_hits} 个官方一手来源，可作为三渠道命中同页的补充证据")
         return QualityReport(True, "覆盖度足够，待 Agent 语义复核", reasons, [], metrics)
 
     # 接近门槛但已有交叉证据时标为边界情况，由 Agent 决定是否值得花积分。

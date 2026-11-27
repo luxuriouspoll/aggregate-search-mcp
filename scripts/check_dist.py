@@ -18,7 +18,7 @@ DIST = PROJECT.replace("-", "_")
 PACKAGE = "aggregate_search"
 INIT = f"{PACKAGE}/__init__.py"
 TEMPLATES = {f"{PACKAGE}/templates/{name}" for name in ("env.example", "keys.example.json")}
-SDIST_FILES = {"README.md", "CHANGELOG.md", "docs/usage-guide.md", "LICENSE", "pyproject.toml"}
+SDIST_FILES = {"README.md", "README_EN.md", "CHANGELOG.md", "docs/usage-guide.md", "LICENSE", "pyproject.toml"}
 COMMANDS = ("aggregate-search", "aggregate-search-mcp")
 # Match path components, not substrings: env.example and keys.example.json are templates.
 PRIVATE = (
