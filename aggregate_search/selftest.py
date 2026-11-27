@@ -3457,7 +3457,7 @@ async def t_read_pages():
                 second = await server.web_fetch("https://example.com/long", "parallel", 20000)
                 assert "SECOND_PAGE" in second and "缓存命中" in second and "[20000, 22011)" in second
             for key, (value, _) in list(server._FETCH_CACHE.items()):
-                server._FETCH_CACHE[key] = (value, 0)
+                server._FETCH_CACHE[key] = (value, server.time.monotonic() - 301)
             again = await server.web_fetch("https://example.com/long", "parallel", 20000)
             assert "SECOND_PAGE" in again and "缓存命中" not in again
             assert "非负整数" in await server.web_fetch("https://example.com", start_index=-1)
